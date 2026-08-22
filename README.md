@@ -84,9 +84,29 @@ OAuth app is configured correctly before installing the plugin.
 npm install
 npm run build     # produces main.js
 npm run dev       # watch mode
+npm run deploy    # build, then copy into plugins-dev-vault/
 ```
 
-Copy `main.js` and `manifest.json` into
+### Local test vault
+
+`plugins-dev-vault/` in this repo is a gitignored Obsidian vault for testing.
+`npm run deploy` builds and copies `main.js` + `manifest.json` into
+`plugins-dev-vault/.obsidian/plugins/obsidian-github-sync/`.
+
+Open that folder as a vault in Obsidian ("Open folder as vault"), then enable
+the plugin under Settings → Community plugins (turn off Restricted Mode first).
+After a redeploy, toggle the plugin off and on to load the new build.
+
+It is gitignored deliberately: once you sign in, the access token is written to
+`.obsidian/plugins/obsidian-github-sync/data.json` inside the vault.
+
+To deploy into a different vault:
+
+```bash
+node scripts/deploy-dev.mjs /path/to/other/vault
+```
+
+For a manual install elsewhere, copy `main.js` and `manifest.json` into
 `<vault>/.obsidian/plugins/obsidian-github-sync/` and enable the plugin.
 
 To test on iOS, sync that folder to the mobile vault (iCloud/Obsidian Sync) and

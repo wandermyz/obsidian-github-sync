@@ -7,3 +7,7 @@ data.json
 .device.json
 .poll.mjs
 .verify.mjs
+
+# Local Obsidian vault used to test the plugin. Contains a real access token
+# in .obsidian/plugins/*/data.json once signed in — must never be committed.
+plugins-dev-vault/
