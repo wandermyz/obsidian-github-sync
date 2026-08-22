@@ -1,0 +1,19 @@
+{
+  "name": "obsidian-github-sync",
+  "version": "0.0.1",
+  "description": "Sync Obsidian notes with (enterprise) GitHub repos over the GitHub REST API. Mobile-friendly.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": ["obsidian", "github", "sync"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.24.2",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.7.2"
+  }
+}
