@@ -1,5 +1,5 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
-import { GitHubHost, hostFromWebBase } from "./auth";
+import { AccessTokenResponse, GitHubHost, hostFromWebBase, refreshAccessToken } from "./auth";
 import { DeviceFlowModal } from "./deviceFlowModal";
 import { GitHubClient } from "./github";
 
@@ -11,6 +11,10 @@ interface Settings {
 	testRepo: string;
 	accessToken: string;
 	login: string;
+	/** Epoch ms when accessToken expires; 0 when the app issues non-expiring tokens. */
+	accessTokenExpiresAt: number;
+	refreshToken: string;
+	refreshTokenExpiresAt: number;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -20,7 +24,13 @@ const DEFAULT_SETTINGS: Settings = {
 	testRepo: "",
 	accessToken: "",
 	login: "",
+	accessTokenExpiresAt: 0,
+	refreshToken: "",
+	refreshTokenExpiresAt: 0,
 };
+
+/** Renew this long before actual expiry, so a sync doesn't die mid-flight. */
+const REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
 export default class GitHubSyncPlugin extends Plugin {
 	settings: Settings = { ...DEFAULT_SETTINGS };
@@ -47,6 +57,9 @@ export default class GitHubSyncPlugin extends Plugin {
 			callback: async () => {
 				this.settings.accessToken = "";
 				this.settings.login = "";
+				this.settings.accessTokenExpiresAt = 0;
+				this.settings.refreshToken = "";
+				this.settings.refreshTokenExpiresAt = 0;
 				await this.saveSettings();
 				new Notice("Signed out.");
 			},
@@ -68,11 +81,47 @@ export default class GitHubSyncPlugin extends Plugin {
 			this.settings.clientId,
 			this.settings.scope,
 			async (token) => {
-				this.settings.accessToken = token.access_token;
-				await this.saveSettings();
+				await this.storeToken(token);
 				await this.verifyAccess();
 			},
 		).open();
+	}
+
+	/** Persist a token response, recording expiry when the app uses expiring tokens. */
+	private async storeToken(token: AccessTokenResponse) {
+		const now = Date.now();
+		this.settings.accessToken = token.access_token;
+		this.settings.accessTokenExpiresAt = token.expires_in ? now + token.expires_in * 1000 : 0;
+		// GitHub rotates the refresh token on each use; keep the newest.
+		if (token.refresh_token) {
+			this.settings.refreshToken = token.refresh_token;
+			this.settings.refreshTokenExpiresAt = token.refresh_token_expires_in
+				? now + token.refresh_token_expires_in * 1000
+				: 0;
+		}
+		await this.saveSettings();
+	}
+
+	/**
+	 * Return a usable access token, refreshing first if it is expired or close
+	 * to it. Returns "" when the user must sign in again.
+	 */
+	async validAccessToken(): Promise<string> {
+		const { accessToken, accessTokenExpiresAt, refreshToken } = this.settings;
+		if (!accessToken) return "";
+		// Non-expiring token, or still comfortably valid.
+		if (accessTokenExpiresAt === 0) return accessToken;
+		if (Date.now() < accessTokenExpiresAt - REFRESH_MARGIN_MS) return accessToken;
+
+		if (!refreshToken) return "";
+		try {
+			const renewed = await refreshAccessToken(this.host, this.settings.clientId, refreshToken);
+			await this.storeToken(renewed);
+			return renewed.access_token;
+		} catch (err) {
+			console.error("[github-sync] refresh failed", err);
+			return "";
+		}
 	}
 
 	/**
@@ -80,11 +129,12 @@ export default class GitHubSyncPlugin extends Plugin {
 	 * and read a file from the configured repo.
 	 */
 	async verifyAccess() {
-		if (!this.settings.accessToken) {
-			new Notice("Not signed in.");
+		const token = await this.validAccessToken();
+		if (!token) {
+			new Notice("Not signed in — run the sign-in command.");
 			return;
 		}
-		const client = new GitHubClient(this.host, this.settings.accessToken);
+		const client = new GitHubClient(this.host, token);
 		try {
 			const user = await client.currentUser();
 			this.settings.login = user.login;
@@ -187,9 +237,23 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		const status = this.plugin.settings.accessToken
-			? `Signed in${this.plugin.settings.login ? ` as ${this.plugin.settings.login}` : ""}.`
-			: "Not signed in.";
+		const s = this.plugin.settings;
+		let status: string;
+		if (!s.accessToken) {
+			status = "Not signed in.";
+		} else {
+			status = `Signed in${s.login ? ` as ${s.login}` : ""}.`;
+			if (s.accessTokenExpiresAt) {
+				const mins = Math.round((s.accessTokenExpiresAt - Date.now()) / 60000);
+				status +=
+					mins > 0
+						? ` Token valid ${mins > 90 ? `${Math.round(mins / 60)}h` : `${mins}m`}` +
+							(s.refreshToken ? "; auto-renews." : "; no refresh token.")
+						: s.refreshToken
+							? " Token expired; will auto-renew."
+							: " Token expired — sign in again.";
+			}
+		}
 
 		new Setting(containerEl)
 			.setName("Account")

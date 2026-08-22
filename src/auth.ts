@@ -29,6 +29,42 @@ export interface AccessTokenResponse {
 	access_token: string;
 	token_type: string;
 	scope: string;
+	/** Present only when the OAuth app has expiring tokens enabled. */
+	expires_in?: number;
+	refresh_token?: string;
+	refresh_token_expires_in?: number;
+}
+
+/**
+ * Exchange a refresh token for a fresh access token.
+ *
+ * Only relevant when the OAuth app opts into expiring tokens; then the access
+ * token lasts ~8h and the refresh token ~6 months. GitHub rotates the refresh
+ * token on every use, so the caller must persist both halves of the response.
+ */
+export async function refreshAccessToken(
+	host: GitHubHost,
+	clientId: string,
+	refreshToken: string,
+): Promise<AccessTokenResponse> {
+	const res = await requestUrl({
+		url: `${host.webBase}/login/oauth/access_token`,
+		method: "POST",
+		headers: { Accept: "application/json", "Content-Type": "application/json" },
+		body: JSON.stringify({
+			client_id: clientId,
+			refresh_token: refreshToken,
+			grant_type: "refresh_token",
+		}),
+		throw: false,
+	});
+	const json = res.json ?? {};
+	if (!json.access_token) {
+		throw new Error(
+			json.error_description ?? json.error ?? `Token refresh failed (HTTP ${res.status})`,
+		);
+	}
+	return json as AccessTokenResponse;
 }
 
 /**

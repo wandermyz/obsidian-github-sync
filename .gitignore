@@ -3,3 +3,7 @@ main.js
 *.js.map
 data.json
 .DS_Store
+.token
+.device.json
+.poll.mjs
+.verify.mjs

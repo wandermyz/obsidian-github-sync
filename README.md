@@ -4,8 +4,15 @@ An Obsidian plugin that syncs notes with GitHub — including GitHub Enterprise
 Server — over the **GitHub REST API**. No Git implementation in JavaScript, so
 it works on mobile, including Obsidian on iOS.
 
-Current status: **OAuth device flow + repo read verification.** Sync itself is
-not implemented yet.
+Current status: **OAuth device flow + repo read verified end to end.** Sync
+itself is not implemented yet.
+
+## Verified
+
+Run against the real OAuth app on 2026-08-21: device code issued, authorized in
+a browser, token exchanged, then `/user`, a repo listing, and a raw file read
+all succeeded. The app returns **expiring tokens** (8h access token + 6-month
+rotating refresh token), so token refresh is implemented — see below.
 
 ## Why the device flow
 
@@ -18,6 +25,20 @@ avoids both: the plugin shows a short code, `window.open` hands the URL to the
 user finishes. Any existing enterprise SSO session in that browser is reused.
 
 There is no embedded web view anywhere in this codebase.
+
+## Token lifetime
+
+This OAuth app has expiring user tokens enabled, so the device flow returns an
+access token valid ~8 hours plus a refresh token valid ~6 months. Every API
+path goes through `validAccessToken()`, which silently exchanges the refresh
+token when the access token is within 5 minutes of expiry. GitHub **rotates the
+refresh token on each use**, so both halves of the response are persisted
+together; dropping the new refresh token would strand the plugin at the next
+renewal. Once the refresh token itself lapses (6 months idle), the user signs in
+again.
+
+If the app is later switched to non-expiring tokens, `expires_in` is absent, the
+stored expiry is `0`, and the refresh path is simply never taken.
 
 ## Setup
 
