@@ -9,7 +9,6 @@ interface Settings {
 	githubWebBase: string;
 	scope: string;
 	/** owner/repo the verification commands read from. */
-	testRepo: string;
 	accessToken: string;
 	login: string;
 	/** Epoch ms when accessToken expires; 0 when the app issues non-expiring tokens. */
@@ -37,7 +36,6 @@ const DEFAULT_SETTINGS: Settings = {
 	clientId: "",
 	githubWebBase: "https://github.com",
 	scope: "repo read:org",
-	testRepo: "",
 	accessToken: "",
 	login: "",
 	accessTokenExpiresAt: 0,
@@ -65,10 +63,22 @@ export default class GitHubSyncPlugin extends Plugin {
 	private syncing = false;
 	private autoSyncTimer: number | null = null;
 	statusBar: HTMLElement | null = null;
+	/**
+	 * The settings tab, so state changes driven from outside it (finishing the
+	 * device flow, a sync completing) can redraw it instead of leaving stale
+	 * text until the user navigates away and back.
+	 */
+	settingTab: GitHubSyncSettingTab | null = null;
+
+	/** Redraw the settings tab if it is currently on screen. */
+	refreshSettingsTab() {
+		this.settingTab?.refresh();
+	}
 
 	async onload() {
 		await this.loadSettings();
-		this.addSettingTab(new GitHubSyncSettingTab(this.app, this));
+		this.settingTab = new GitHubSyncSettingTab(this.app, this);
+		this.addSettingTab(this.settingTab);
 		this.statusBar = this.addStatusBarItem();
 		this.renderStatusBar();
 
@@ -106,6 +116,7 @@ export default class GitHubSyncPlugin extends Plugin {
 				this.settings.refreshToken = "";
 				this.settings.refreshTokenExpiresAt = 0;
 				await this.saveSettings();
+				this.refreshSettingsTab();
 				new Notice("Signed out.");
 			},
 		});
@@ -162,6 +173,9 @@ export default class GitHubSyncPlugin extends Plugin {
 			this.settings.scope,
 			async (token) => {
 				await this.storeToken(token);
+				// Redraw before verifying: verification hits the network, and the
+				// button should already read "Re-authenticate" by then.
+				this.refreshSettingsTab();
 				await this.verifyAccess();
 			},
 		).open();
@@ -206,7 +220,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
 	/**
 	 * End-to-end proof the flow worked: identify the token's user, then list
-	 * and read a file from the configured repo.
+	 * and read a file from the sync repo.
 	 */
 	async verifyAccess() {
 		const token = await this.validAccessToken();
@@ -219,26 +233,28 @@ export default class GitHubSyncPlugin extends Plugin {
 			const user = await client.currentUser();
 			this.settings.login = user.login;
 			await this.saveSettings();
+			this.refreshSettingsTab();
 			new Notice(`Signed in as ${user.login}`);
 
-			const [owner, repo] = this.settings.testRepo.split("/");
+			const [owner, repo] = this.settings.syncRepo.split("/");
 			if (!owner || !repo) {
-				new Notice("Set a test repo (owner/repo) to verify file reads.");
+				new Notice("Set the sync repository (owner/repo) to verify file reads.");
 				return;
 			}
 
-			const entries = await client.listDirectory(owner, repo);
-			console.log(`[github-sync] ${owner}/${repo} root:`, entries);
+			const dir = this.settings.remoteFolder.trim();
+			const entries = await client.listDirectory(owner, repo, dir);
+			console.log(`[github-sync] ${owner}/${repo}/${dir} :`, entries);
 
 			const firstFile = entries.find((e) => e.type === "file");
 			if (!firstFile) {
-				new Notice(`Listed ${entries.length} entries; repo root has no files.`);
+				new Notice(`Listed ${entries.length} entries; no files at ${dir || "the repo root"}.`);
 				return;
 			}
 			const content = await client.readFile(owner, repo, firstFile.path);
 			console.log(`[github-sync] ${firstFile.path} (${content.length} chars):\n${content.slice(0, 500)}`);
 			new Notice(
-				`Read ${firstFile.path} — ${content.length} chars. ${entries.length} entries at root.`,
+				`Read ${firstFile.path} — ${content.length} chars. ${entries.length} entries at ${dir || "root"}.`,
 			);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -381,6 +397,9 @@ export default class GitHubSyncPlugin extends Plugin {
 }
 
 class GitHubSyncSettingTab extends PluginSettingTab {
+	/** Only true while the tab is on screen; redrawing a hidden tab is wasted work. */
+	private open = false;
+
 	constructor(
 		app: App,
 		private plugin: GitHubSyncPlugin,
@@ -388,7 +407,18 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
+	hide() {
+		this.open = false;
+		super.hide();
+	}
+
+	/** Redraw only if the user is actually looking at this tab. */
+	refresh() {
+		if (this.open) this.display();
+	}
+
 	display() {
+		this.open = true;
 		const { containerEl } = this;
 		containerEl.empty();
 
@@ -428,19 +458,6 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 				}),
 			);
 
-		new Setting(containerEl)
-			.setName("Test repository")
-			.setDesc("owner/repo — used by the verify command to list and read a file.")
-			.addText((t) =>
-				t
-					.setPlaceholder("owner/repo")
-					.setValue(this.plugin.settings.testRepo)
-					.onChange(async (v) => {
-						this.plugin.settings.testRepo = v.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
 		const s = this.plugin.settings;
 		let status: string;
 		if (!s.accessToken) {
@@ -464,15 +481,9 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 			.setDesc(status)
 			.addButton((b) =>
 				b
-					.setButtonText(this.plugin.settings.accessToken ? "Re-authenticate" : "Sign in")
+					.setButtonText(s.accessToken ? "Re-authenticate" : "Sign in")
 					.setCta()
 					.onClick(() => this.plugin.signIn()),
-			)
-			.addButton((b) =>
-				b.setButtonText("Verify access").onClick(async () => {
-					await this.plugin.verifyAccess();
-					this.display();
-				}),
 			);
 
 		new Setting(containerEl).setName("Sync").setHeading();
@@ -542,13 +553,19 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 					.setCta()
 					.onClick(async () => {
 						await this.plugin.sync("manual");
-						this.display();
+						this.refresh();
 					}),
 			)
 			.addButton((b) =>
 				b.setButtonText("Full resync").onClick(async () => {
 					await this.plugin.sync("manual", true);
-					this.display();
+					this.refresh();
+				}),
+			)
+			.addButton((b) =>
+				b.setButtonText("Verify access").onClick(async () => {
+					await this.plugin.verifyAccess();
+					this.refresh();
 				}),
 			);
 
@@ -572,7 +589,7 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 					this.plugin.settings.autoSyncEnabled = v;
 					await this.plugin.saveSettings();
 					this.plugin.restartAutoSyncTimer();
-					this.display();
+					this.refresh();
 				}),
 			);
 
