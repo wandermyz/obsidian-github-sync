@@ -23,6 +23,11 @@ export interface LocalState {
 	refreshTokenExpiresAt: number;
 	/** Vault contents as of the last successful sync. */
 	syncState: SyncState | null;
+	/**
+	 * Short name for this device, used in commit messages and conflict copies.
+	 * Per-device by definition, so it lives here rather than in data.json.
+	 */
+	deviceLabel: string;
 }
 
 export const DEFAULT_LOCAL: LocalState = {
@@ -32,6 +37,7 @@ export const DEFAULT_LOCAL: LocalState = {
 	refreshToken: "",
 	refreshTokenExpiresAt: 0,
 	syncState: null,
+	deviceLabel: "",
 };
 
 /** Filename inside the plugin folder. Add this to .gitignore. */

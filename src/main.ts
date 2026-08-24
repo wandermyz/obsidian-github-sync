@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, Platform, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { AccessTokenResponse, GitHubHost, hostFromWebBase, refreshAccessToken } from "./auth";
 import { DeviceFlowModal } from "./deviceFlowModal";
 import { GitHubClient } from "./github";
@@ -45,6 +45,13 @@ const REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
 /** Wait this long after startup before auto-syncing, so launch stays responsive. */
 const STARTUP_SYNC_DELAY_MS = 3000;
+
+/**
+ * How many pull/push rounds to attempt before giving up. Each extra round means
+ * another device pushed while we were pushing; two retries is plenty for a
+ * personal vault, and looping forever would be worse than asking the user.
+ */
+const PUSH_RETRY_LIMIT = 3;
 
 export default class GitHubSyncPlugin extends Plugin {
 	settings: Settings = { ...DEFAULT_SETTINGS };
@@ -307,30 +314,27 @@ export default class GitHubSyncPlugin extends Plugin {
 				branch,
 				targetFolder: this.settings.targetFolder.trim(),
 				remoteFolder: this.settings.remoteFolder.trim(),
+				deviceLabel: this.deviceLabel(),
 			});
 
-			const state = forceFull ? null : this.local.syncState;
-			const plan = await engine.plan(state);
+			// Pull, then push. Another device can land a commit between the two,
+			// which the push detects via the fast-forward check; the fix is simply
+			// to pull again and re-push, so the pair runs in a bounded loop.
+			for (let attempt = 1; ; attempt++) {
+				const pulled = await this.pull(engine, forceFull && attempt === 1, loud);
+				if (!pulled) return;
 
-			if (plan.writes.length === 0 && plan.deletes.length === 0) {
-				if (loud) new Notice("Already up to date.");
-				this.local.syncState = {
-					commit: plan.targetCommit,
-					blobs: state?.blobs ?? {},
-					lastSyncedAt: Date.now(),
-				};
-				await this.saveLocal();
-				this.renderStatusBar();
-				return;
+				const push = await this.pushChanges(engine, loud);
+				if (!push.raced) return;
+
+				if (attempt >= PUSH_RETRY_LIMIT) {
+					new Notice(
+						"GitHub Sync: the branch kept moving while pushing. Your local changes are safe — try again.",
+						10000,
+					);
+					return;
+				}
 			}
-
-			const { report, state: newState } = await engine.apply(plan, state, (done, total) => {
-				this.renderStatusBar(`Syncing ${done}/${total}…`);
-			});
-
-			this.local.syncState = newState;
-			await this.saveLocal();
-			this.reportSync(report, loud);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			console.error("[github-sync] sync failed", err);
@@ -341,6 +345,84 @@ export default class GitHubSyncPlugin extends Plugin {
 			this.syncing = false;
 			this.renderStatusBar();
 		}
+	}
+
+	/** Download side of a sync. Returns false if the run should stop here. */
+	private async pull(engine: SyncEngine, forceFull: boolean, loud: boolean): Promise<boolean> {
+		const state = forceFull ? null : this.local.syncState;
+		const plan = await engine.plan(state);
+
+		if (plan.writes.length === 0 && plan.deletes.length === 0) {
+			this.local.syncState = {
+				commit: plan.targetCommit,
+				blobs: state?.blobs ?? {},
+				lastSyncedAt: Date.now(),
+			};
+			await this.saveLocal();
+			return true;
+		}
+
+		const { report, state: newState } = await engine.apply(plan, state, (done, total) => {
+			this.renderStatusBar(`Pulling ${done}/${total}…`);
+		});
+
+		this.local.syncState = newState;
+		await this.saveLocal();
+		this.reportSync(report, loud);
+
+		// A pull that didn't fully verify leaves the commit pointer behind, so the
+		// disk no longer describes a known commit. Pushing from there could delete
+		// remote files we merely failed to download.
+		if (!newState.commit) {
+			new Notice("GitHub Sync: pull incomplete — skipping upload until it succeeds.", 10000);
+			return false;
+		}
+		return true;
+	}
+
+	/** Upload side of a sync. */
+	private async pushChanges(engine: SyncEngine, loud: boolean): Promise<{ raced: boolean }> {
+		const state = this.local.syncState;
+		if (!state?.commit) return { raced: false };
+
+		const { report, state: newState } = await engine.push(state, (done, total) => {
+			this.renderStatusBar(`Pushing ${done}/${total}…`);
+		});
+
+		if (report.raced) return { raced: true };
+
+		if (report.blocked) {
+			new Notice(`GitHub Sync: ${report.blocked}`, 15000);
+			return { raced: false };
+		}
+
+		this.local.syncState = newState;
+		await this.saveLocal();
+
+		console.log("[github-sync] push report", report);
+		if (report.commit) {
+			const parts: string[] = [];
+			if (report.uploaded.length) parts.push(`${report.uploaded.length} uploaded`);
+			if (report.removed.length) parts.push(`${report.removed.length} removed`);
+			new Notice(`GitHub Sync: pushed ${parts.join(", ")}.`);
+		} else if (loud) {
+			new Notice("Nothing local to push.");
+		}
+		return { raced: false };
+	}
+
+	/**
+	 * A stable name for this device, generated once and kept in local.json.
+	 * Obsidian exposes no device identity, so a short random suffix is enough to
+	 * tell two devices apart in a commit log or a conflict filename.
+	 */
+	private deviceLabel(): string {
+		if (!this.local.deviceLabel) {
+			const platform = Platform.isMobile ? "mobile" : "desktop";
+			this.local.deviceLabel = `${platform}-${Math.random().toString(36).slice(2, 6)}`;
+			void this.saveLocal();
+		}
+		return this.local.deviceLabel;
 	}
 
 	private reportSync(report: SyncReport, loud: boolean) {
@@ -357,6 +439,14 @@ export default class GitHubSyncPlugin extends Plugin {
 			new Notice(
 				`GitHub Sync: ${report.integrityFailures.length} file(s) failed verification and will retry next sync:\n` +
 					report.integrityFailures.slice(0, 5).join("\n"),
+				15000,
+			);
+		}
+		if (report.conflicts.length) {
+			new Notice(
+				`GitHub Sync: ${report.conflicts.length} file(s) changed both here and remotely. ` +
+					`Your version was kept beside the remote one:\n` +
+					report.conflicts.slice(0, 5).join("\n"),
 				15000,
 			);
 		}

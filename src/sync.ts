@@ -1,5 +1,5 @@
 import { DataAdapter, Vault, normalizePath } from "obsidian";
-import { CompareFile, GitHubClient } from "./github";
+import { CompareFile, GitHubClient, TreeEntry, errorStatus } from "./github";
 import { gitBlobSha } from "./gitHash";
 
 /**
@@ -23,6 +23,8 @@ export interface SyncOptions {
 	targetFolder: string;
 	/** Repo subfolder to sync from; "" means the repo root. */
 	remoteFolder: string;
+	/** Short name for this device, used in commit messages and conflict copies. */
+	deviceLabel: string;
 }
 
 export type SyncMode = "full" | "incremental";
@@ -35,10 +37,23 @@ export interface SyncReport {
 	deleted: number;
 	unchanged: number;
 	skippedLocalEdits: string[];
+	/** Paths where local and remote both changed; the local copy was preserved beside it. */
+	conflicts: string[];
 	verifiedFiles: number;
 	integrityFailures: string[];
 	/** Human-readable reason a full sync was chosen over an incremental one. */
 	reason: string;
+}
+
+/** What a push actually did. */
+export interface PushReport {
+	uploaded: string[];
+	removed: string[];
+	commit: string | null;
+	/** Set when the branch moved underneath us and the caller should sync again. */
+	raced: boolean;
+	/** Set when the push was declined for safety; carries the explanation. */
+	blocked: string | null;
 }
 
 /** One file operation to apply to the vault. */
@@ -63,6 +78,22 @@ export interface SyncPlan {
  */
 function isRefused(path: string): boolean {
 	return path === ".obsidian" || path.startsWith(".obsidian/") || path.includes("/.obsidian/");
+}
+
+/**
+ * Mass-deletion guard. A push that removes most of what we synced is far more
+ * likely to be a broken vault path than a deliberate cleanup, so it's refused
+ * and the user is told to run a full resync if they meant it. Small vaults are
+ * exempt below MIN_DELETIONS_BEFORE_GUARD, where any fraction is meaningless.
+ */
+const MAX_DELETION_FRACTION = 0.1;
+const MIN_DELETIONS_BEFORE_GUARD = 5;
+
+/** Local time, formatted for a filename (no colons — Windows and iOS reject them). */
+function conflictStamp(): string {
+	const d = new Date();
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}.${pad(d.getMinutes())}`;
 }
 
 export class SyncEngine {
@@ -202,6 +233,7 @@ export class SyncEngine {
 			deleted: 0,
 			unchanged: plan.unchanged,
 			skippedLocalEdits: [],
+			conflicts: [],
 			verifiedFiles: 0,
 			integrityFailures: [],
 			reason: plan.reason,
@@ -222,12 +254,22 @@ export class SyncEngine {
 				}
 			}
 
-			// Refuse to clobber a file the user changed since the last sync.
+			// Local and remote both moved. Rather than drop either side, the remote
+			// version takes the canonical path and the local bytes are preserved
+			// beside it as a conflict copy — the next push sends that copy up, so
+			// both versions exist everywhere and the user resolves it by editing.
 			if (exists && blobs[write.path]) {
-				if ((await this.hashOnDisk(write.path)) !== blobs[write.path]) {
-					report.skippedLocalEdits.push(write.path);
-					onProgress?.(++done, total);
-					continue;
+				const onDisk = await this.hashOnDisk(write.path);
+				if (onDisk !== blobs[write.path]) {
+					const copy = await this.makeConflictCopy(write.path);
+					if (copy) {
+						report.conflicts.push(copy);
+					} else {
+						// Couldn't preserve the local bytes, so don't overwrite them.
+						report.skippedLocalEdits.push(write.path);
+						onProgress?.(++done, total);
+						continue;
+					}
 				}
 			}
 
@@ -281,6 +323,206 @@ export class SyncEngine {
 		};
 
 		return { report, state: newState };
+	}
+
+	/**
+	 * Push local changes to the branch via the Git Data API.
+	 *
+	 * Must run *after* a clean pull: `state.commit` has to be the branch head, so
+	 * every difference between the disk and `state.blobs` is genuinely a local
+	 * change rather than a remote one we haven't fetched. The whole push is one
+	 * commit, and the ref update is a fast-forward-only compare-and-swap, so a
+	 * concurrent push from another device is detected rather than clobbered.
+	 */
+	async push(
+		state: SyncState,
+		onProgress?: (done: number, total: number) => void,
+	): Promise<{ report: PushReport; state: SyncState }> {
+		const { owner, repo, branch } = this.opts;
+		const report: PushReport = { uploaded: [], removed: [], commit: null, raced: false, blocked: null };
+
+		const head = await this.client.branchHead(owner, repo, branch);
+		if (head !== state.commit) {
+			// The branch moved since we pulled; pushing now would build a tree on
+			// top of a base we haven't seen. Let the caller pull again first.
+			report.raced = true;
+			return { report, state };
+		}
+
+		const changes = await this.detectLocalChanges(state);
+		if (changes.changed.length === 0 && changes.removed.length === 0) {
+			return { report, state };
+		}
+
+		const tracked = Object.keys(state.blobs).length;
+		// A vault that failed to mount, or a folder setting typo, looks exactly
+		// like "the user deleted everything". Refuse rather than wipe the repo.
+		if (
+			tracked > 0 &&
+			changes.removed.length > MIN_DELETIONS_BEFORE_GUARD &&
+			changes.removed.length / tracked > MAX_DELETION_FRACTION
+		) {
+			report.blocked =
+				`Refusing to push: ${changes.removed.length} of ${tracked} synced files are missing locally. ` +
+				`Run a full resync if this is intentional.`;
+			return { report, state };
+		}
+
+		const total = changes.changed.length + 1;
+		let done = 0;
+
+		const entries: TreeEntry[] = [];
+		const newBlobs: Record<string, string> = { ...state.blobs };
+
+		for (const path of changes.changed) {
+			const content = await this.adapter.readBinary(path);
+			const sha = await this.client.createBlob(owner, repo, content);
+			entries.push({ path: this.toRepoPath(path), mode: "100644", type: "blob", sha });
+			// Hash the bytes we uploaded, not the file again — the user may be
+			// typing, and the state has to describe what the commit contains.
+			newBlobs[path] = await gitBlobSha(content);
+			report.uploaded.push(path);
+			onProgress?.(++done, total);
+		}
+
+		for (const path of changes.removed) {
+			entries.push({ path: this.toRepoPath(path), mode: "100644", type: "blob", sha: null });
+			delete newBlobs[path];
+			report.removed.push(path);
+		}
+
+		const message = this.commitMessage(report);
+		const treeSha = await this.client.createTree(owner, repo, head, entries);
+		const commitSha = await this.client.createCommit(owner, repo, message, treeSha, [head]);
+
+		try {
+			await this.client.updateRef(owner, repo, branch, commitSha);
+		} catch (err) {
+			// 422 is the fast-forward check firing: someone pushed between our
+			// head read and the ref update. The commit object we made is orphaned
+			// and harmless; the caller re-syncs and we try again from the new head.
+			if (errorStatus(err) === 422) {
+				report.raced = true;
+				return { report, state };
+			}
+			throw err;
+		}
+
+		onProgress?.(++done, total);
+		report.commit = commitSha;
+		return {
+			report,
+			state: { commit: commitSha, blobs: newBlobs, lastSyncedAt: Date.now() },
+		};
+	}
+
+	private commitMessage(report: PushReport): string {
+		const parts: string[] = [];
+		if (report.uploaded.length) parts.push(`${report.uploaded.length} updated`);
+		if (report.removed.length) parts.push(`${report.removed.length} removed`);
+		const detail = parts.join(", ");
+		const only = report.uploaded.length + report.removed.length === 1;
+		const subject = only
+			? `Update ${(report.uploaded[0] ?? report.removed[0]) as string}`
+			: `Sync ${detail}`;
+		return `${subject}\n\nFrom ${this.opts.deviceLabel} via obsidian-github-sync.`;
+	}
+
+	/**
+	 * Compare the disk against the last-synced blob SHAs.
+	 *
+	 * `changed` covers both edits and brand-new files; `removed` is a path we
+	 * previously synced that is no longer on disk. An untracked file that isn't
+	 * on disk simply never appears.
+	 */
+	private async detectLocalChanges(state: SyncState): Promise<{ changed: string[]; removed: string[] }> {
+		const changed: string[] = [];
+		const removed: string[] = [];
+
+		const onDisk = await this.listLocalFiles();
+		for (const path of onDisk) {
+			const sha = await this.hashOnDisk(path);
+			if (sha && sha !== state.blobs[path]) changed.push(path);
+		}
+
+		const present = new Set(onDisk);
+		for (const path of Object.keys(state.blobs)) {
+			if (!present.has(path)) removed.push(path);
+		}
+
+		return { changed, removed };
+	}
+
+	/**
+	 * Every syncable file under the target folder, listed from the filesystem.
+	 *
+	 * The Vault index is not used here for the same reason writes don't use it:
+	 * a file the user just created may not be indexed yet, and silently not
+	 * pushing it is worse than a slightly slower walk.
+	 */
+	private async listLocalFiles(): Promise<string[]> {
+		const root = this.opts.targetFolder.replace(/\/+$/, "");
+		const found: string[] = [];
+		const queue = [root];
+
+		while (queue.length) {
+			const dir = queue.shift() as string;
+			if (dir && !(await this.adapter.exists(dir))) continue;
+
+			const listing = await this.adapter.list(dir === "" ? "/" : dir);
+			for (const folder of listing.folders) {
+				if (this.isSkippedFolder(folder)) continue;
+				queue.push(folder);
+			}
+			for (const file of listing.files) {
+				const relative = root ? file.slice(root.length + 1) : file;
+				if (isRefused(relative)) continue;
+				found.push(file);
+			}
+		}
+
+		return found;
+	}
+
+	/** Obsidian's own state and trash are never the user's notes. */
+	private isSkippedFolder(folder: string): boolean {
+		const name = folder.split("/").pop() ?? "";
+		return name === ".obsidian" || name === ".trash" || name === ".git";
+	}
+
+	/** Inverse of toVaultPath: vault path -> path inside the repo. */
+	private toRepoPath(vaultPath: string): string {
+		const target = this.opts.targetFolder.replace(/\/+$/, "");
+		const relative = target && vaultPath.startsWith(`${target}/`)
+			? vaultPath.slice(target.length + 1)
+			: vaultPath;
+		const remote = this.opts.remoteFolder.replace(/\/+$/, "");
+		return remote ? `${remote}/${relative}` : relative;
+	}
+
+	/**
+	 * Copy the on-disk version aside before a remote version overwrites it.
+	 *
+	 * Naming mirrors what Obsidian Sync does: the user ends up with two files
+	 * side by side in the same folder and merges them by hand. Returns the new
+	 * path, or null if the copy itself failed — in which case the caller must
+	 * not overwrite the original.
+	 */
+	private async makeConflictCopy(path: string): Promise<string | null> {
+		try {
+			const content = await this.adapter.readBinary(path);
+			const dot = path.lastIndexOf(".");
+			const slash = path.lastIndexOf("/");
+			const hasExt = dot > slash;
+			const stem = hasExt ? path.slice(0, dot) : path;
+			const ext = hasExt ? path.slice(dot) : "";
+			const target = `${stem} (conflict ${conflictStamp()} ${this.opts.deviceLabel})${ext}`;
+			await this.adapter.writeBinary(target, content);
+			return target;
+		} catch (err) {
+			console.warn("[github-sync] could not write conflict copy for", path, err);
+			return null;
+		}
 	}
 
 	/**

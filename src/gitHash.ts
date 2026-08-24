@@ -46,3 +46,16 @@ export function base64ToBytes(base64: string): ArrayBuffer {
 	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 	return bytes.buffer;
 }
+
+/** Encode raw bytes as base64 for a blob upload. */
+export function bytesToBase64(content: ArrayBuffer): string {
+	const bytes = new Uint8Array(content);
+	// Chunked: String.fromCharCode with a whole vault-sized file spread across
+	// its arguments blows the call-stack limit.
+	let binary = "";
+	const CHUNK = 0x8000;
+	for (let i = 0; i < bytes.length; i += CHUNK) {
+		binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+	}
+	return btoa(binary);
+}

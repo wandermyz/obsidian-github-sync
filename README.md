@@ -1,13 +1,13 @@
 # obsidian-github-sync
 
-An Obsidian plugin that pulls notes from a GitHub repository — including GitHub
+An Obsidian plugin that syncs notes with a GitHub repository — including GitHub
 Enterprise Server — over the **GitHub REST API**. There is no Git
 implementation in JavaScript and no native code, so it works on mobile,
 including Obsidian on iOS.
 
-Status: **early**. One-way sync (GitHub → vault) works, with incremental
-updates, integrity verification, and automatic syncing. Pushing local changes
-back to GitHub is not implemented yet.
+Status: **early**. Sync is bi-directional: it pulls changes from GitHub and
+pushes local edits back as ordinary commits, with incremental updates,
+integrity verification, conflict copies, and automatic syncing.
 
 ## Why this exists
 
@@ -59,6 +59,51 @@ Blobs are fetched **by SHA rather than by path**, so a branch that moves
 mid-sync can't hand back bytes belonging to a different commit than the one
 being applied.
 
+### Pushing local changes
+
+Every sync pulls first, then pushes. Pushing uses the **Git Data API**, which is
+how a Git client would build a commit if it spoke HTTP instead of the wire
+protocol:
+
+1. each changed file is uploaded as a blob (`POST /git/blobs`, base64, so images
+   and PDFs survive intact);
+2. one tree is created on top of the current head's tree (`POST /git/trees` with
+   `base_tree`), listing only the changed paths — a deletion is an entry with
+   `sha: null`;
+3. one commit is created pointing at that tree (`POST /git/commits`);
+4. the branch is moved to it (`PATCH /git/refs/heads/{branch}` with
+   `force: false`).
+
+The whole push is therefore a single ordinary commit that any Git client can
+read. `force: false` makes step 4 a compare-and-swap: if another device pushed
+in the meantime, GitHub rejects it with 422, the plugin pulls again and retries
+rather than overwriting the other device's work.
+
+Local changes are found by hashing the files on disk and comparing against the
+blob SHAs recorded at the last sync — no filesystem watching, no timestamps.
+Pushing is skipped entirely when the preceding pull didn't fully verify, since
+in that state a file missing locally is indistinguishable from a file deleted
+locally.
+
+As a further guard, a push that would remove more than 10% of the synced files
+is refused with a notice rather than executed. A vault that failed to mount or a
+mistyped folder setting looks exactly like "the user deleted everything".
+
+### Conflicts
+
+When a file changed both locally and remotely since the last sync, nothing is
+discarded. The remote version takes the canonical path, and your local bytes are
+written beside it as
+
+```
+My Note (conflict 2026-08-23 14.05 mobile-a3f2).md
+```
+
+That copy is a normal vault file, so the next push uploads it too — both
+versions then exist on every device, and you resolve the conflict by editing and
+deleting, the same way Obsidian Sync handles it. The device label is generated
+once per device and kept in `local.json`.
+
 ### Integrity verification
 
 After each file is written, it is read back from the vault and hashed as a Git
@@ -73,12 +118,14 @@ doesn't actually match, and the missing files would never be noticed again.
 
 ### What it won't touch
 
-- Files you edited locally since the last sync are **skipped**, not overwritten,
-  and reported. Since there's no push yet, the plugin never destroys work it
-  can't restore.
-- Anything under `.obsidian/` is refused outright, so a repository can't
-  overwrite your plugin configuration — including the `local.json` holding your
-  access token.
+- Files you edited locally since the last sync are never overwritten: the remote
+  version lands at the canonical path and yours is preserved as a conflict copy
+  (see above). If the copy can't be written, the remote update is skipped
+  instead.
+- Anything under `.obsidian/` is refused in both directions, so a repository
+  can't overwrite your plugin configuration — and your configuration, including
+  the `local.json` holding your access token, is never pushed. `.trash/` and
+  `.git/` are skipped when pushing for the same reason.
 
 ## Setup
 
@@ -109,14 +156,16 @@ authorize the OAuth app for the organization from its settings page.
 - **Periodic sync** — runs on a timer while Obsidian is open, at a configurable
   interval.
 
+Both are full bi-directional syncs, the same as pressing **Sync now**.
+
 Background runs stay quiet unless something changed. Failures, integrity
-mismatches, and skipped local edits always raise a notice.
+mismatches, conflicts, and refused pushes always raise a notice.
 
 ## Commands
 
-- **Sync now**
+- **Sync now** — pull, then push
 - **Full resync (rebuild from scratch)** — ignores stored state and walks the
-  whole tree
+  whole tree, then pushes as usual
 - **Sign in to GitHub (device flow)**
 - **Verify GitHub access** — calls `/user`, lists a repo root, reads a file
 - **Sign out of GitHub**
@@ -168,7 +217,7 @@ The plugin writes two files into
 | File | Contents | Safe to sync/commit? |
 | --- | --- | --- |
 | `data.json` | Settings: host, client ID, scopes, repo, branch, folders, auto-sync options | **Yes** |
-| `local.json` | OAuth access and refresh tokens, and the per-device sync state | **No** |
+| `local.json` | OAuth access and refresh tokens, the per-device sync state, and this device's label | **No** |
 
 The split exists so you can keep your configuration in version control while
 excluding the credential. Add to the vault's `.gitignore`:
@@ -193,9 +242,9 @@ token goes with it.
 src/
   auth.ts             device flow: request code, poll for token, refresh, host resolution
   deviceFlowModal.ts  sign-in UI; opens the system browser only
-  github.ts           REST client: user, tree, compare, blobs
-  gitHash.ts          git blob SHA-1, used for integrity checks
-  sync.ts             sync engine: plan (incremental or full), apply, verify
+  github.ts           REST client: user, tree, compare, blobs, and the Git Data write API
+  gitHash.ts          git blob SHA-1 and base64, used for integrity checks and uploads
+  sync.ts             sync engine: plan (incremental or full), apply, verify, push
   storage.ts          local.json: token + per-device sync state, kept out of data.json
   main.ts             plugin entry, commands, settings, auto-sync timers
 scripts/
