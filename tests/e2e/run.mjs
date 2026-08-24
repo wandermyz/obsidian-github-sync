@@ -45,6 +45,37 @@ function assertEqual(actual, expected, message) {
 }
 
 /**
+ * Give the branch a root commit if the repo has none.
+ *
+ * A brand-new GitHub repo reports a `default_branch` that doesn't exist as a
+ * ref yet, so every read 404s. Uses the contents API rather than the client,
+ * which has no create-ref call — this is scaffolding, not code under test.
+ */
+async function bootstrapBranch(token, ctx) {
+	const res = await fetch(
+		`https://api.github.com/repos/${ctx.owner}/${ctx.repo}/contents/README.md`,
+		{
+			method: "PUT",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				Accept: "application/vnd.github+json",
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				message: "Initialize test vault repository",
+				content: Buffer.from(
+					"# obsidian-github-sync test vault\n\nScratch repo for the e2e suite. Contents are expendable.\n",
+					"utf8",
+				).toString("base64"),
+				branch: ctx.branch,
+			}),
+		},
+	);
+	if (!res.ok) throw new Error(`Could not bootstrap ${ctx.branch}: ${res.status} ${await res.text()}`);
+	console.log(`  bootstrapped empty repo with a root commit on ${ctx.branch}`);
+}
+
+/**
  * Commit files straight to the branch, standing in for "another device pushed".
  * `null` content deletes the path.
  */
@@ -132,6 +163,14 @@ async function main() {
 	const branch = config.branch || (await client.defaultBranch(config.owner, config.repo));
 	const ctx = { owner: config.owner, repo: config.repo, branch };
 	console.log(`  as:     ${user.login} on branch ${branch}\n`);
+
+	// An empty repo names a default branch that has no ref behind it.
+	try {
+		await client.branchHead(ctx.owner, ctx.repo, ctx.branch);
+	} catch (err) {
+		if (engine.errorStatus(err) !== 404) throw err;
+		await bootstrapBranch(token, ctx);
+	}
 
 	try {
 		await run(engine, client, ctx);
