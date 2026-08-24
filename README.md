@@ -77,7 +77,7 @@ doesn't actually match, and the missing files would never be noticed again.
   and reported. Since there's no push yet, the plugin never destroys work it
   can't restore.
 - Anything under `.obsidian/` is refused outright, so a repository can't
-  overwrite your plugin configuration — including the `data.json` holding your
+  overwrite your plugin configuration — including the `local.json` holding your
   access token.
 
 ## Setup
@@ -153,18 +153,39 @@ vault ("Open folder as vault"), turn off Restricted Mode, and enable the plugin.
 After a redeploy, toggle the plugin off and on to load the new build.
 
 It is gitignored deliberately: once you sign in, the access token is written to
-`.obsidian/plugins/obsidian-github-sync/data.json` inside that vault. To deploy
+`.obsidian/plugins/obsidian-github-sync/local.json` inside that vault. To deploy
 elsewhere:
 
 ```bash
 node scripts/deploy-dev.mjs /path/to/other/vault
 ```
 
-## Security note
+## Where state is stored
 
-The access token is stored in the plugin's `data.json` inside the vault, in
-plaintext — the same place every Obsidian plugin keeps its credentials. If the
-vault itself syncs somewhere, the token goes with it.
+The plugin writes two files into
+`<vault>/.obsidian/plugins/obsidian-github-sync/`:
+
+| File | Contents | Safe to sync/commit? |
+| --- | --- | --- |
+| `data.json` | Settings: host, client ID, scopes, repo, branch, folders, auto-sync options | **Yes** |
+| `local.json` | OAuth access and refresh tokens, and the per-device sync state | **No** |
+
+The split exists so you can keep your configuration in version control while
+excluding the credential. Add to the vault's `.gitignore`:
+
+```
+.obsidian/plugins/obsidian-github-sync/local.json
+```
+
+`local.json` also holds the last synced commit and the blob SHA of every file
+written. That is per-device by nature: copying it to another machine would make
+that machine believe it already holds files it has never downloaded, and it
+would skip them indefinitely. Deleting the file is always safe — the next sync
+does a full rebuild.
+
+The tokens are stored in plaintext, the same as every Obsidian plugin's
+credentials. If the vault syncs somewhere and `local.json` isn't excluded, the
+token goes with it.
 
 ## Layout
 
@@ -175,6 +196,7 @@ src/
   github.ts           REST client: user, tree, compare, blobs
   gitHash.ts          git blob SHA-1, used for integrity checks
   sync.ts             sync engine: plan (incremental or full), apply, verify
+  storage.ts          local.json: token + per-device sync state, kept out of data.json
   main.ts             plugin entry, commands, settings, auto-sync timers
 scripts/
   device-flow-test.mjs  standalone CLI check

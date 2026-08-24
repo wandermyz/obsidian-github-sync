@@ -2,6 +2,7 @@ node_modules/
 main.js
 *.js.map
 data.json
+local.json
 .DS_Store
 .token
 .device.json

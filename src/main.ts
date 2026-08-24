@@ -2,19 +2,17 @@ import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { AccessTokenResponse, GitHubHost, hostFromWebBase, refreshAccessToken } from "./auth";
 import { DeviceFlowModal } from "./deviceFlowModal";
 import { GitHubClient } from "./github";
-import { SyncEngine, SyncReport, SyncState } from "./sync";
+import { SyncEngine, SyncReport } from "./sync";
+import { DEFAULT_LOCAL, LOCAL_FILE, LocalState, loadLocalState, saveLocalState } from "./storage";
 
+/**
+ * Synced settings. Deliberately holds no credentials and no per-device state —
+ * see storage.ts. This is what `data.json` contains, and it is safe to commit.
+ */
 interface Settings {
 	clientId: string;
 	githubWebBase: string;
 	scope: string;
-	/** owner/repo the verification commands read from. */
-	accessToken: string;
-	login: string;
-	/** Epoch ms when accessToken expires; 0 when the app issues non-expiring tokens. */
-	accessTokenExpiresAt: number;
-	refreshToken: string;
-	refreshTokenExpiresAt: number;
 
 	/** owner/repo to sync notes from. */
 	syncRepo: string;
@@ -27,20 +25,12 @@ interface Settings {
 	syncOnStartup: boolean;
 	autoSyncEnabled: boolean;
 	autoSyncMinutes: number;
-
-	/** Vault contents as of the last successful sync. */
-	syncState: SyncState | null;
 }
 
 const DEFAULT_SETTINGS: Settings = {
 	clientId: "",
 	githubWebBase: "https://github.com",
 	scope: "repo read:org",
-	accessToken: "",
-	login: "",
-	accessTokenExpiresAt: 0,
-	refreshToken: "",
-	refreshTokenExpiresAt: 0,
 	syncRepo: "",
 	branch: "",
 	remoteFolder: "",
@@ -48,7 +38,6 @@ const DEFAULT_SETTINGS: Settings = {
 	syncOnStartup: false,
 	autoSyncEnabled: false,
 	autoSyncMinutes: 15,
-	syncState: null,
 };
 
 /** Renew this long before actual expiry, so a sync doesn't die mid-flight. */
@@ -59,6 +48,8 @@ const STARTUP_SYNC_DELAY_MS = 3000;
 
 export default class GitHubSyncPlugin extends Plugin {
 	settings: Settings = { ...DEFAULT_SETTINGS };
+	/** Credentials and per-device sync state; never written to data.json. */
+	local: LocalState = { ...DEFAULT_LOCAL };
 	/** Guards against overlapping runs (auto timer firing during a manual sync). */
 	private syncing = false;
 	private autoSyncTimer: number | null = null;
@@ -110,12 +101,10 @@ export default class GitHubSyncPlugin extends Plugin {
 			id: "sign-out",
 			name: "Sign out of GitHub",
 			callback: async () => {
-				this.settings.accessToken = "";
-				this.settings.login = "";
-				this.settings.accessTokenExpiresAt = 0;
-				this.settings.refreshToken = "";
-				this.settings.refreshTokenExpiresAt = 0;
-				await this.saveSettings();
+				// Keep syncState: the vault still holds those files, so a later
+				// sign-in should resume incrementally rather than refetch everything.
+				this.local = { ...DEFAULT_LOCAL, syncState: this.local.syncState };
+				await this.saveLocal();
 				this.refreshSettingsTab();
 				new Notice("Signed out.");
 			},
@@ -184,16 +173,16 @@ export default class GitHubSyncPlugin extends Plugin {
 	/** Persist a token response, recording expiry when the app uses expiring tokens. */
 	private async storeToken(token: AccessTokenResponse) {
 		const now = Date.now();
-		this.settings.accessToken = token.access_token;
-		this.settings.accessTokenExpiresAt = token.expires_in ? now + token.expires_in * 1000 : 0;
+		this.local.accessToken = token.access_token;
+		this.local.accessTokenExpiresAt = token.expires_in ? now + token.expires_in * 1000 : 0;
 		// GitHub rotates the refresh token on each use; keep the newest.
 		if (token.refresh_token) {
-			this.settings.refreshToken = token.refresh_token;
-			this.settings.refreshTokenExpiresAt = token.refresh_token_expires_in
+			this.local.refreshToken = token.refresh_token;
+			this.local.refreshTokenExpiresAt = token.refresh_token_expires_in
 				? now + token.refresh_token_expires_in * 1000
 				: 0;
 		}
-		await this.saveSettings();
+		await this.saveLocal();
 	}
 
 	/**
@@ -201,7 +190,7 @@ export default class GitHubSyncPlugin extends Plugin {
 	 * to it. Returns "" when the user must sign in again.
 	 */
 	async validAccessToken(): Promise<string> {
-		const { accessToken, accessTokenExpiresAt, refreshToken } = this.settings;
+		const { accessToken, accessTokenExpiresAt, refreshToken } = this.local;
 		if (!accessToken) return "";
 		// Non-expiring token, or still comfortably valid.
 		if (accessTokenExpiresAt === 0) return accessToken;
@@ -231,8 +220,8 @@ export default class GitHubSyncPlugin extends Plugin {
 		const client = new GitHubClient(this.host, token);
 		try {
 			const user = await client.currentUser();
-			this.settings.login = user.login;
-			await this.saveSettings();
+			this.local.login = user.login;
+			await this.saveLocal();
 			this.refreshSettingsTab();
 			new Notice(`Signed in as ${user.login}`);
 
@@ -265,10 +254,15 @@ export default class GitHubSyncPlugin extends Plugin {
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.local = await loadLocalState(this);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async saveLocal() {
+		await saveLocalState(this, this.local);
 	}
 
 	/**
@@ -315,17 +309,17 @@ export default class GitHubSyncPlugin extends Plugin {
 				remoteFolder: this.settings.remoteFolder.trim(),
 			});
 
-			const state = forceFull ? null : this.settings.syncState;
+			const state = forceFull ? null : this.local.syncState;
 			const plan = await engine.plan(state);
 
 			if (plan.writes.length === 0 && plan.deletes.length === 0) {
 				if (loud) new Notice("Already up to date.");
-				this.settings.syncState = {
+				this.local.syncState = {
 					commit: plan.targetCommit,
 					blobs: state?.blobs ?? {},
 					lastSyncedAt: Date.now(),
 				};
-				await this.saveSettings();
+				await this.saveLocal();
 				this.renderStatusBar();
 				return;
 			}
@@ -334,8 +328,8 @@ export default class GitHubSyncPlugin extends Plugin {
 				this.renderStatusBar(`Syncing ${done}/${total}…`);
 			});
 
-			this.settings.syncState = newState;
-			await this.saveSettings();
+			this.local.syncState = newState;
+			await this.saveLocal();
 			this.reportSync(report, loud);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -385,7 +379,7 @@ export default class GitHubSyncPlugin extends Plugin {
 			this.statusBar.setText(`⟳ ${override}`);
 			return;
 		}
-		const state = this.settings.syncState;
+		const state = this.local.syncState;
 		if (!state?.lastSyncedAt) {
 			this.statusBar.setText("");
 			return;
@@ -459,18 +453,19 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 			);
 
 		const s = this.plugin.settings;
+		const l = this.plugin.local;
 		let status: string;
-		if (!s.accessToken) {
+		if (!l.accessToken) {
 			status = "Not signed in.";
 		} else {
-			status = `Signed in${s.login ? ` as ${s.login}` : ""}.`;
-			if (s.accessTokenExpiresAt) {
-				const mins = Math.round((s.accessTokenExpiresAt - Date.now()) / 60000);
+			status = `Signed in${l.login ? ` as ${l.login}` : ""}.`;
+			if (l.accessTokenExpiresAt) {
+				const mins = Math.round((l.accessTokenExpiresAt - Date.now()) / 60000);
 				status +=
 					mins > 0
 						? ` Token valid ${mins > 90 ? `${Math.round(mins / 60)}h` : `${mins}m`}` +
-							(s.refreshToken ? "; auto-renews." : "; no refresh token.")
-						: s.refreshToken
+							(l.refreshToken ? "; auto-renews." : "; no refresh token.")
+						: l.refreshToken
 							? " Token expired; will auto-renew."
 							: " Token expired — sign in again.";
 			}
@@ -478,10 +473,10 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Account")
-			.setDesc(status)
+			.setDesc(`${status} Stored in ${LOCAL_FILE}, separate from your synced settings.`)
 			.addButton((b) =>
 				b
-					.setButtonText(s.accessToken ? "Re-authenticate" : "Sign in")
+					.setButtonText(l.accessToken ? "Re-authenticate" : "Sign in")
 					.setCta()
 					.onClick(() => this.plugin.signIn()),
 			);
@@ -540,8 +535,8 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		const lastSync = s.syncState?.lastSyncedAt
-			? `Last synced ${new Date(s.syncState.lastSyncedAt).toLocaleString()} at ${s.syncState.commit.slice(0, 7)}.`
+		const lastSync = l.syncState?.lastSyncedAt
+			? `Last synced ${new Date(l.syncState.lastSyncedAt).toLocaleString()} at ${l.syncState.commit.slice(0, 7)}.`
 			: "Never synced.";
 
 		new Setting(containerEl)
