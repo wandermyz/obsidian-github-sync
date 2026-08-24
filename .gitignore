@@ -19,3 +19,6 @@ local.json
 # Local Obsidian vault used to test the plugin. Contains a real access token
 # in .obsidian/plugins/*/data.json once signed in — must never be committed.
 plugins-dev-vault/
+
+# Generated esbuild bundle for the e2e tests.
+tests/e2e/.build/
