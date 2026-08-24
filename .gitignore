@@ -9,6 +9,13 @@ local.json
 .poll.mjs
 .verify.mjs
 
+# End-to-end test config and its cached OAuth token. The config names a real
+# repository the tests push to; the token is a live credential.
+.env.e2e
+.e2e-token.json
+# Scratch vaults the e2e tests create and tear down.
+.e2e-tmp/
+
 # Local Obsidian vault used to test the plugin. Contains a real access token
 # in .obsidian/plugins/*/data.json once signed in — must never be committed.
 plugins-dev-vault/

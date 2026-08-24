@@ -179,6 +179,39 @@ node scripts/device-flow-test.mjs <client_id> owner/repo [https://github.example
 Runs the identical request sequence from a terminal — useful to confirm the
 OAuth app is configured correctly before installing the plugin.
 
+## End-to-end tests
+
+`tests/e2e/` exercises the real engine against a real GitHub repository. There
+are no mocks: `src/sync.ts` and `src/github.ts` are bundled through esbuild with
+`obsidian` aliased to a Node shim, so the code under test is the code that
+ships, and every request goes to the live API.
+
+Configuration lives in `.env.e2e`, which is gitignored — it names a repository
+the tests will push to and delete from:
+
+```bash
+cp .env.e2e.example .env.e2e   # then fill in E2E_REPO and E2E_CLIENT_ID
+npm run test:e2e:login         # once, interactively — opens a device code
+npm run test:e2e               # thereafter, non-interactive
+```
+
+`test:e2e:login` runs the device flow and caches the token in `.e2e-token.json`
+(also gitignored, mode 600). Later runs reuse it, refreshing automatically when
+it expires; both halves are re-persisted because GitHub rotates refresh tokens.
+`test:e2e` never prompts — it fails with instructions if no usable token is
+cached, so it stays usable from CI or a non-interactive shell.
+
+**Use a throwaway repository.** The tests commit, force the branch forward, and
+delete paths. They confine themselves to a per-run `e2e/<id>/` folder and remove
+it afterwards, so parallel runs don't collide, but the token needs `repo` scope
+and nothing stops a bug from reaching further.
+
+Covered: first full sync, incremental edit/add/delete, a no-op sync, pushing new
+and edited and deleted files, a second device pulling what the first pushed,
+concurrent-push race detection, a both-sides edit producing a conflict copy that
+then pushes, the mass-deletion guard refusing, and `.obsidian` never being
+materialized from the repo.
+
 ## Build and install
 
 ```bash
@@ -250,6 +283,12 @@ src/
 scripts/
   device-flow-test.mjs  standalone CLI check
   deploy-dev.mjs        copy build into a vault
+tests/e2e/
+  run.mjs            the test cases, against a real repo
+  login.mjs          one-time interactive device-flow sign-in
+  config.mjs         .env.e2e loading and the cached-token lifecycle
+  obsidian-shim.mjs  Node stand-ins for requestUrl, the vault adapter, Platform
+  load-engine.mjs    esbuild bundle of src/ with `obsidian` aliased to the shim
 ```
 
 ## License

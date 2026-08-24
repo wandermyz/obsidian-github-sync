@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "deploy": "npm run build && node scripts/deploy-dev.mjs"
+    "deploy": "npm run build && node scripts/deploy-dev.mjs",
+    "test:e2e": "node tests/e2e/run.mjs",
+    "test:e2e:login": "node tests/e2e/login.mjs"
   },
   "keywords": ["obsidian", "github", "sync"],
   "license": "MIT",
