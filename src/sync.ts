@@ -1,4 +1,4 @@
-import { Vault, normalizePath } from "obsidian";
+import { DataAdapter, Vault, normalizePath } from "obsidian";
 import { CompareFile, GitHubClient } from "./github";
 import { gitBlobSha } from "./gitHash";
 
@@ -66,11 +66,18 @@ function isRefused(path: string): boolean {
 }
 
 export class SyncEngine {
+	/**
+	 * All file I/O goes through the adapter, not the Vault API — see writeFile().
+	 */
+	private adapter: DataAdapter;
+
 	constructor(
 		private vault: Vault,
 		private client: GitHubClient,
 		private opts: SyncOptions,
-	) {}
+	) {
+		this.adapter = vault.adapter;
+	}
 
 	/** Map a repo path to its vault path, or null if outside the synced subtree. */
 	private toVaultPath(repoPath: string): string | null {
@@ -204,12 +211,11 @@ export class SyncEngine {
 		let done = 0;
 
 		for (const write of plan.writes) {
-			const existing = this.vault.getFileByPath(write.path);
+			const exists = await this.adapter.exists(write.path);
 
 			// Nothing to do when the local file is already this exact blob.
-			if (existing && blobs[write.path] === write.blobSha) {
-				const current = await this.vault.readBinary(existing);
-				if ((await gitBlobSha(current)) === write.blobSha) {
+			if (exists && blobs[write.path] === write.blobSha) {
+				if ((await this.hashOnDisk(write.path)) === write.blobSha) {
 					report.unchanged++;
 					onProgress?.(++done, total);
 					continue;
@@ -217,9 +223,8 @@ export class SyncEngine {
 			}
 
 			// Refuse to clobber a file the user changed since the last sync.
-			if (existing && blobs[write.path]) {
-				const current = await gitBlobSha(await this.vault.readBinary(existing));
-				if (current !== blobs[write.path]) {
+			if (exists && blobs[write.path]) {
+				if ((await this.hashOnDisk(write.path)) !== blobs[write.path]) {
 					report.skippedLocalEdits.push(write.path);
 					onProgress?.(++done, total);
 					continue;
@@ -229,39 +234,28 @@ export class SyncEngine {
 			const content = await this.client.readBlob(this.opts.owner, this.opts.repo, write.blobSha);
 
 			await this.ensureParentFolder(write.path);
-			if (existing) {
-				await this.vault.modifyBinary(existing, content);
-				report.updated++;
-			} else {
-				await this.vault.createBinary(write.path, content);
-				report.added++;
-			}
+			await this.writeFile(write.path, content);
+			if (exists) report.updated++;
+			else report.added++;
 
 			// Integrity check: re-read what we just wrote and hash it.
-			const written = this.vault.getFileByPath(write.path);
-			if (!written) {
-				report.integrityFailures.push(`${write.path} (missing after write)`);
+			const actual = await this.hashOnDisk(write.path);
+			if (actual === write.blobSha) {
+				blobs[write.path] = write.blobSha;
+				report.verifiedFiles++;
 			} else {
-				const actual = await gitBlobSha(await this.vault.readBinary(written));
-				if (actual === write.blobSha) {
-					blobs[write.path] = write.blobSha;
-					report.verifiedFiles++;
-				} else {
-					report.integrityFailures.push(`${write.path} (sha mismatch)`);
-					// Don't record a SHA we couldn't confirm — next sync retries it.
-					delete blobs[write.path];
-				}
+				report.integrityFailures.push(
+					actual === null ? `${write.path} (missing after write)` : `${write.path} (sha mismatch)`,
+				);
+				// Don't record a SHA we couldn't confirm — next sync retries it.
+				delete blobs[write.path];
 			}
 
 			onProgress?.(++done, total);
 		}
 
 		for (const path of plan.deletes) {
-			const file = this.vault.getFileByPath(path);
-			if (file) {
-				await this.vault.trash(file, true);
-				report.deleted++;
-			}
+			if (await this.removeFile(path)) report.deleted++;
 			delete blobs[path];
 			onProgress?.(++done, total);
 		}
@@ -272,11 +266,7 @@ export class SyncEngine {
 			const planned = new Set(plan.writes.map((w) => w.path));
 			for (const tracked of Object.keys(blobs)) {
 				if (planned.has(tracked)) continue;
-				const file = this.vault.getFileByPath(tracked);
-				if (file) {
-					await this.vault.trash(file, true);
-					report.deleted++;
-				}
+				if (await this.removeFile(tracked)) report.deleted++;
 				delete blobs[tracked];
 			}
 		}
@@ -293,16 +283,52 @@ export class SyncEngine {
 		return { report, state: newState };
 	}
 
-	/** Vault.createBinary fails if the parent folder doesn't exist yet. */
+	/**
+	 * Write through the adapter rather than `Vault.createBinary`.
+	 *
+	 * The Vault API is index-first: it decides a path is free by consulting its
+	 * in-memory file list, which lags behind the disk right after a sync writes a
+	 * batch of files, and on mobile can lag by a lot. `createBinary` on a path the
+	 * index hasn't caught up to throws "File already exists" — the incremental
+	 * update is then lost even though the file is plainly there. The adapter talks
+	 * to the filesystem, so create and overwrite are the same call and no
+	 * existence check can go stale between the check and the write.
+	 */
+	private async writeFile(path: string, content: ArrayBuffer) {
+		await this.adapter.writeBinary(path, content);
+	}
+
+	/** Git blob SHA of what's on disk, or null if the path isn't there. */
+	private async hashOnDisk(path: string): Promise<string | null> {
+		if (!(await this.adapter.exists(path))) return null;
+		return gitBlobSha(await this.adapter.readBinary(path));
+	}
+
+	/** Returns true if a file was actually removed. */
+	private async removeFile(path: string): Promise<boolean> {
+		if (!(await this.adapter.exists(path))) return false;
+		// trashLocal keeps the file recoverable in .trash, matching what the
+		// Vault API did before, but works from a path instead of a TFile.
+		await this.adapter.trashLocal(path);
+		return true;
+	}
+
+	/** A binary write fails if the parent folder doesn't exist yet. */
 	private async ensureParentFolder(path: string) {
 		const slash = path.lastIndexOf("/");
 		if (slash <= 0) return;
-		const folder = path.slice(0, slash);
-		if (this.vault.getFolderByPath(folder)) return;
-		try {
-			await this.vault.createFolder(folder);
-		} catch {
-			// Concurrent creation or already-exists; harmless.
+		// Walk down creating each missing ancestor: mkdir won't create
+		// intermediate folders, and a repo can introduce several levels at once.
+		const parts = path.slice(0, slash).split("/");
+		let folder = "";
+		for (const part of parts) {
+			folder = folder ? `${folder}/${part}` : part;
+			if (await this.adapter.exists(folder)) continue;
+			try {
+				await this.adapter.mkdir(folder);
+			} catch {
+				// Concurrent creation or already-exists; harmless.
+			}
 		}
 	}
 }
