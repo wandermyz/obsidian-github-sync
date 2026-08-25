@@ -15,7 +15,8 @@ export interface CompareFile {
 	filename: string;
 	/** git status; "renamed" also carries previous_filename. */
 	status: "added" | "removed" | "modified" | "renamed" | "copied" | "changed" | "unchanged";
-	sha: string;
+	/** Absent for entries GitHub won't attribute to a blob, e.g. submodules. */
+	sha?: string | null;
 	previous_filename?: string;
 }
 
@@ -185,6 +186,9 @@ export class GitHubClient {
 	 * against. Returns base64 for binary safety.
 	 */
 	async readBlob(owner: string, repo: string, blobSha: string): Promise<ArrayBuffer> {
+		if (!/^[0-9a-f]{40}$/.test(blobSha ?? "")) {
+			throw new Error(`Refusing to fetch a blob with a malformed SHA: ${JSON.stringify(blobSha)}`);
+		}
 		const json = await this.api(`/repos/${owner}/${repo}/git/blobs/${blobSha}`);
 		if (json.encoding !== "base64") {
 			throw new Error(`Unexpected blob encoding "${json.encoding}" for ${blobSha}`);

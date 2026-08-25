@@ -1,7 +1,7 @@
 {
   "id": "obsidian-github-sync",
   "name": "GitHub Sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.5.0",
   "description": "Sync notes with GitHub (including GitHub Enterprise) using the REST API. Works on mobile.",
   "author": "wandermyz",

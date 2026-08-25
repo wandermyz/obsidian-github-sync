@@ -89,6 +89,15 @@ function isRefused(path: string): boolean {
 const MAX_DELETION_FRACTION = 0.1;
 const MIN_DELETIONS_BEFORE_GUARD = 5;
 
+/**
+ * A git object SHA is exactly 40 lowercase hex characters. GitHub rejects
+ * anything else with a 422, so checking here turns a confusing API error into a
+ * decision we can act on.
+ */
+export function isBlobSha(sha: unknown): sha is string {
+	return typeof sha === "string" && /^[0-9a-f]{40}$/.test(sha);
+}
+
 /** Local time, formatted for a filename (no colons — Windows and iOS reject them). */
 function conflictStamp(): string {
 	const d = new Date();
@@ -169,7 +178,7 @@ export class SyncEngine {
 		const deletes: string[] = [];
 
 		for (const file of comparison.files) {
-			this.applyCompareEntry(file, writes, deletes);
+			if (!this.applyCompareEntry(file, writes, deletes)) return null;
 		}
 
 		return {
@@ -182,12 +191,20 @@ export class SyncEngine {
 		};
 	}
 
-	private applyCompareEntry(file: CompareFile, writes: PlannedWrite[], deletes: string[]) {
+	/**
+	 * Fold one compare entry into the plan. Returns false when the entry can't be
+	 * planned from the diff alone, which forces a full sync.
+	 */
+	private applyCompareEntry(
+		file: CompareFile,
+		writes: PlannedWrite[],
+		deletes: string[],
+	): boolean {
 		const vaultPath = this.toVaultPath(file.filename);
 
 		if (file.status === "removed") {
 			if (vaultPath) deletes.push(vaultPath);
-			return;
+			return true;
 		}
 
 		if (file.status === "renamed" && file.previous_filename) {
@@ -196,8 +213,18 @@ export class SyncEngine {
 		}
 
 		// "unchanged" appears in compare output for files touched then reverted.
-		if (file.status === "unchanged") return;
-		if (vaultPath) writes.push({ path: vaultPath, blobSha: file.sha });
+		if (file.status === "unchanged") return true;
+		if (!vaultPath) return true;
+
+		// Compare entries aren't guaranteed to carry a blob SHA. Submodules
+		// (gitlinks) have none, and GitHub omits it for entries it won't attribute
+		// to a single blob. Interpolating a missing one produces a request for
+		// .../git/blobs/null, so bail to a full sync, which reads real SHAs out of
+		// the tree and skips every non-blob entry.
+		if (!isBlobSha(file.sha)) return false;
+
+		writes.push({ path: vaultPath, blobSha: file.sha });
+		return true;
 	}
 
 	private async fullPlan(head: string, reason: string): Promise<SyncPlan> {

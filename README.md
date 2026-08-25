@@ -179,6 +179,16 @@ node scripts/device-flow-test.mjs <client_id> owner/repo [https://github.example
 Runs the identical request sequence from a terminal — useful to confirm the
 OAuth app is configured correctly before installing the plugin.
 
+## Tests
+
+`tests/unit/` covers sync planning — the decisions the engine makes about an API
+response — with a stub client and no network. It's fast and needs no
+configuration:
+
+```bash
+npm test
+```
+
 ## End-to-end tests
 
 `tests/e2e/` exercises the real engine against a real GitHub repository. There
@@ -289,6 +299,8 @@ tests/e2e/
   config.mjs         .env.e2e loading and the cached-token lifecycle
   obsidian-shim.mjs  Node stand-ins for requestUrl, the vault adapter, Platform
   load-engine.mjs    esbuild bundle of src/ with `obsidian` aliased to the shim
+tests/unit/
+  plan.test.mjs      offline planning tests against a stub client
 ```
 
 ## License
