@@ -8,9 +8,17 @@ import {
 	Setting,
 	SettingDefinitionItem,
 } from "obsidian";
-import { AccessTokenResponse, GitHubHost, hostFromWebBase, refreshAccessToken } from "./auth";
+import {
+	AccessTokenResponse,
+	DEFAULT_APP,
+	GitHubHost,
+	hostFromWebBase,
+	isGitHubApp,
+	refreshAccessToken,
+	resolveClientId,
+} from "./auth";
 import { DeviceFlowModal } from "./deviceFlowModal";
-import { GitHubClient } from "./github";
+import { GitHubClient, errorStatus } from "./github";
 import { SyncEngine, SyncReport } from "./sync";
 import { DEFAULT_LOCAL, LOCAL_FILE, LocalState, loadLocalState, saveLocalState } from "./storage";
 
@@ -166,21 +174,32 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 		return hostFromWebBase(this.settings.githubWebBase);
 	}
 
+	/** The app to sign in with: the configured client ID, else the built-in app on github.com. */
+	get clientId(): string {
+		return resolveClientId(this.settings.clientId, this.host);
+	}
+
 	signIn() {
-		if (!this.settings.clientId) {
-			new Notice("Set the OAuth app client ID in settings first.");
+		const clientId = this.clientId;
+		if (!clientId) {
+			new Notice(
+				"GitHub Enterprise Server needs its own app: register one with device flow on your server, then enter its client ID in settings.",
+				10000,
+			);
 			return;
 		}
 		new DeviceFlowModal(
 			this.app,
 			this.host,
-			this.settings.clientId,
-			this.settings.scope,
-			(token) => void this.onSignedIn(token),
+			clientId,
+			// GitHub Apps take their permissions from the app, not from scopes.
+			isGitHubApp(clientId) ? "" : this.settings.scope,
+			(token) => void this.onSignedIn(token, clientId),
 		).open();
 	}
 
-	private async onSignedIn(token: AccessTokenResponse) {
+	private async onSignedIn(token: AccessTokenResponse, clientId: string) {
+		this.local.clientId = clientId;
 		await this.storeToken(token);
 		// Redraw before verifying: verification hits the network, and the
 		// button should already read "Re-authenticate" by then.
@@ -216,7 +235,8 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 
 		if (!refreshToken) return "";
 		try {
-			const renewed = await refreshAccessToken(this.host, this.settings.clientId, refreshToken);
+			const clientId = this.local.clientId || this.clientId;
+			const renewed = await refreshAccessToken(this.host, clientId, refreshToken);
 			await this.storeToken(renewed);
 			return renewed.access_token;
 		} catch (err) {
@@ -262,10 +282,40 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 				`Read ${firstFile.path} — ${content.length} chars. ${entries.length} entries at ${dir || "root"}.`,
 			);
 		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
 			console.error("[github-enterprise-sync]", err);
-			new Notice(`Verification failed: ${message}`, 10000);
+			this.notifyFailure("Verification failed", err);
 		}
+	}
+
+	/**
+	 * Report a failed request. From a GitHub App token, a 404 almost always
+	 * means the app isn't installed on the repository (GitHub hides private
+	 * repos the token can't reach), and so does a 403 "not accessible by
+	 * integration" (a public repo: readable, but not writable). Say so, with a
+	 * link when it's the built-in app.
+	 */
+	private notifyFailure(prefix: string, err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		const issuer = this.local.clientId || this.clientId;
+		const status = errorStatus(err);
+		const notInstalled =
+			status === 404 || (status === 403 && /not accessible by integration/i.test(message));
+		if (!notInstalled || !isGitHubApp(issuer)) {
+			new Notice(`${prefix}: ${message}`, 10000);
+			return;
+		}
+		const repo = this.settings.syncRepo || "the repository";
+		new Notice(
+			createFragment((f) => {
+				f.appendText(`${prefix}: can't see ${repo}. The app can only reach repositories it's installed on. `);
+				if (issuer === DEFAULT_APP.clientId) {
+					f.createEl("a", { text: "Choose repositories", href: DEFAULT_APP.installUrl });
+				} else {
+					f.appendText("Ask the app's owner to install it on this repository.");
+				}
+			}),
+			15000,
+		);
 	}
 
 	async loadSettings() {
@@ -350,11 +400,10 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 				}
 			}
 		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
 			console.error("[github-enterprise-sync] sync failed", err);
 			// Failures are always surfaced — a silently broken sync is worse
 			// than a noisy one.
-			new Notice(`GitHub Enterprise Sync failed: ${message}`, 10000);
+			this.notifyFailure("GitHub Enterprise Sync failed", err);
 		} finally {
 			this.syncing = false;
 			this.renderStatusBar();
@@ -528,13 +577,17 @@ class GitHubEnterpriseSyncSettingTab extends PluginSettingTab {
 				},
 			},
 			{
-				name: "OAuth app client ID",
-				desc: "From the GitHub OAuth app with device flow enabled.",
-				control: { type: "text", key: "clientId", placeholder: "Iv1.xxxxxxxxxxxx" },
+				name: "App client ID",
+				desc:
+					"Leave empty to use the plugin's GitHub App on github.com. For GitHub Enterprise Server, " +
+					"register a GitHub App or OAuth app with device flow on your server and enter its client ID.",
+				aliases: ["oauth", "github app"],
+				control: { type: "text", key: "clientId", placeholder: "Built-in app" },
 			},
 			{
 				name: "Scopes",
-				desc: "Space-separated OAuth scopes.",
+				desc: "Space-separated OAuth scopes. Only OAuth apps use these.",
+				visible: () => !isGitHubApp(this.plugin.clientId),
 				control: { type: "text", key: "scope" },
 			},
 			{
@@ -544,6 +597,16 @@ class GitHubEnterpriseSyncSettingTab extends PluginSettingTab {
 					this.accountRow = setting;
 					setting.addButton((b) => b.setCta().onClick(() => this.plugin.signIn()));
 					this.renderAccount();
+				},
+			},
+			{
+				name: "Repository access",
+				desc: "The built-in app can only reach repositories you install it on. Add your notes repository there.",
+				visible: () => this.plugin.clientId === DEFAULT_APP.clientId,
+				render: (setting) => {
+					setting.addButton((b) =>
+						b.setButtonText("Choose repositories").onClick(() => window.open(DEFAULT_APP.installUrl)),
+					);
 				},
 			},
 			{
@@ -644,8 +707,9 @@ class GitHubEnterpriseSyncSettingTab extends PluginSettingTab {
 		}
 		await this.plugin.saveSettings();
 		if (key === "autoSyncEnabled" || key === "autoSyncMinutes") this.plugin.restartAutoSyncTimer();
-		// "Sync interval" is only shown while periodic sync is on.
-		if (key === "autoSyncEnabled") this.refreshDomState();
+		// Rows that depend on these: "Sync interval" on periodic sync; "Scopes"
+		// and "Repository access" on which app signs in.
+		if (key === "autoSyncEnabled" || key === "githubWebBase" || key === "clientId") this.refreshDomState();
 	}
 
 	/** Rewrite the state-driven rows, if they're on screen. */

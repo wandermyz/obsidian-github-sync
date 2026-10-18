@@ -17,6 +17,38 @@ export function hostFromWebBase(webBase: string): GitHubHost {
 	};
 }
 
+/**
+ * The plugin's own GitHub App on github.com, used when no client ID is set, so
+ * github.com users don't have to register an app of their own. The device flow
+ * needs no client secret, so a client ID is public by design.
+ */
+export const DEFAULT_APP = {
+	clientId: "Iv23licEZx8RvafEllsg",
+	installUrl: "https://github.com/apps/obsidian-github-enterprise-sync/installations/new",
+};
+
+export function isGitHubDotCom(host: GitHubHost): boolean {
+	return host.apiBase === "https://api.github.com";
+}
+
+/**
+ * The client ID to sign in with: the configured one, else the built-in app on
+ * github.com. "" on GitHub Enterprise Server with nothing configured — an app
+ * registered on github.com doesn't exist there.
+ */
+export function resolveClientId(configured: string, host: GitHubHost): string {
+	return configured.trim() || (isGitHubDotCom(host) ? DEFAULT_APP.clientId : "");
+}
+
+/**
+ * GitHub App client IDs start with "Iv"; OAuth apps' with "Ov" (or are older
+ * hex IDs). The difference matters to users: a GitHub App ignores scopes and
+ * only reaches repositories it has been installed on.
+ */
+export function isGitHubApp(clientId: string): boolean {
+	return clientId.startsWith("Iv");
+}
+
 export interface DeviceCodeResponse {
 	device_code: string;
 	user_code: string;

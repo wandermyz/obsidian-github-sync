@@ -21,6 +21,12 @@ export interface LocalState {
 	accessTokenExpiresAt: number;
 	refreshToken: string;
 	refreshTokenExpiresAt: number;
+	/**
+	 * The app that issued the tokens. A refresh has to go to the same client ID,
+	 * even if the settings have changed since. "" for tokens stored before this
+	 * was recorded.
+	 */
+	clientId: string;
 	/** Vault contents as of the last successful sync. */
 	syncState: SyncState | null;
 	/**
@@ -36,6 +42,7 @@ export const DEFAULT_LOCAL: LocalState = {
 	accessTokenExpiresAt: 0,
 	refreshToken: "",
 	refreshTokenExpiresAt: 0,
+	clientId: "",
 	syncState: null,
 	deviceLabel: "",
 };
