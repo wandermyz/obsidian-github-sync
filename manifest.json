@@ -1,7 +1,7 @@
 {
   "id": "github-enterprise-sync",
   "name": "GitHub Enterprise Sync",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "minAppVersion": "1.13.0",
   "description": "Sync notes with GitHub or GitHub Enterprise Server through the GitHub REST API, with no Git binary required. Signs in with OAuth device flow, so it works with enterprise SSO and on mobile, including iOS.",
   "author": "wandermyz",
