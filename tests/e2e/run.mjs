@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import { loadEngine, repoRoot } from "./load-engine.mjs";
 import { fakeVault } from "./obsidian-shim.mjs";
 import { getAccessToken, loadConfig } from "./config.mjs";
+import { commitEntries } from "./remote.mjs";
 
 const RUN_ID = randomUUID().slice(0, 8);
 const REMOTE_FOLDER = `e2e/${RUN_ID}`;
@@ -80,7 +81,6 @@ async function bootstrapBranch(token, ctx) {
  * `null` content deletes the path.
  */
 async function remoteCommit(client, ctx, files, message) {
-	const head = await client.branchHead(ctx.owner, ctx.repo, ctx.branch);
 	const entries = [];
 	for (const [relative, content] of Object.entries(files)) {
 		const full = `${REMOTE_FOLDER}/${relative}`;
@@ -91,9 +91,7 @@ async function remoteCommit(client, ctx, files, message) {
 			entries.push({ path: full, mode: "100644", type: "blob", sha });
 		}
 	}
-	const tree = await client.createTree(ctx.owner, ctx.repo, head, entries);
-	const commit = await client.createCommit(ctx.owner, ctx.repo, message, tree, [head]);
-	await client.updateRef(ctx.owner, ctx.repo, ctx.branch, commit);
+	const commit = await commitEntries(client, ctx, entries, message);
 	return commit;
 }
 
@@ -368,16 +366,7 @@ async function cleanup(client, ctx) {
 			type: "blob",
 			sha: null,
 		}));
-		const head = await client.branchHead(ctx.owner, ctx.repo, ctx.branch);
-		const tree = await client.createTree(ctx.owner, ctx.repo, head, entries);
-		const commit = await client.createCommit(
-			ctx.owner,
-			ctx.repo,
-			`e2e ${RUN_ID}: cleanup`,
-			tree,
-			[head],
-		);
-		await client.updateRef(ctx.owner, ctx.repo, ctx.branch, commit);
+		await commitEntries(client, ctx, entries, `e2e ${RUN_ID}: cleanup`);
 		console.log(`\n  cleaned up ${REMOTE_FOLDER} (${files.length} files)`);
 	} catch (err) {
 		console.warn(`\n  cleanup of ${REMOTE_FOLDER} failed: ${err.message}`);

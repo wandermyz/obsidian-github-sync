@@ -21,6 +21,7 @@ import { randomUUID } from "node:crypto";
 import { loadEngine, repoRoot } from "../e2e/load-engine.mjs";
 import { getAccessToken, loadConfig } from "../e2e/config.mjs";
 import { PLUGIN_ID, createVault, emulatePhone, enablePlugin, launch, restore, waitFor } from "./obsidian.mjs";
+import { commitEntries } from "../e2e/remote.mjs";
 
 const RUN_ID = randomUUID().slice(0, 8);
 const TMP_ROOT = path.join(repoRoot, ".e2e-tmp", `app-${RUN_ID}`);
@@ -55,7 +56,6 @@ function assertEqual(actual, expected, message) {
 
 /** Commit straight to the branch, standing in for another device. `null` deletes. */
 async function remoteCommit(client, ctx, folder, files, message) {
-	const head = await client.branchHead(ctx.owner, ctx.repo, ctx.branch);
 	const entries = [];
 	for (const [relative, content] of Object.entries(files)) {
 		const full = `${folder}/${relative}`;
@@ -66,9 +66,7 @@ async function remoteCommit(client, ctx, folder, files, message) {
 			entries.push({ path: full, mode: "100644", type: "blob", sha });
 		}
 	}
-	const tree = await client.createTree(ctx.owner, ctx.repo, head, entries);
-	const commit = await client.createCommit(ctx.owner, ctx.repo, message, tree, [head]);
-	await client.updateRef(ctx.owner, ctx.repo, ctx.branch, commit);
+	const commit = await commitEntries(client, ctx, entries, message);
 	// GitHub's reads can briefly lag a ref update. Wait until the branch reports
 	// the new head, or the plugin may sync against the previous commit.
 	await waitFor(
@@ -376,9 +374,7 @@ async function cleanup(client, ctx, folders) {
 	const doomed = tree.filter((b) => folders.some((f) => b.path.startsWith(`${f}/`)));
 	if (!doomed.length) return;
 	const entries = doomed.map((b) => ({ path: b.path, mode: "100644", type: "blob", sha: null }));
-	const treeSha = await client.createTree(ctx.owner, ctx.repo, head, entries);
-	const commit = await client.createCommit(ctx.owner, ctx.repo, `app-e2e ${RUN_ID}: cleanup`, treeSha, [head]);
-	await client.updateRef(ctx.owner, ctx.repo, ctx.branch, commit);
+	await commitEntries(client, ctx, entries, `app-e2e ${RUN_ID}: cleanup`);
 	console.log(`  removed ${doomed.length} remote file(s)`);
 }
 

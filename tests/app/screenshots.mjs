@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import { loadEngine, repoRoot } from "../e2e/load-engine.mjs";
 import { getAccessToken, loadConfig } from "../e2e/config.mjs";
 import { PLUGIN_ID, createVault, emulatePhone, enablePlugin, launch, restore, waitFor } from "./obsidian.mjs";
+import { commitEntries } from "../e2e/remote.mjs";
 
 const RUN_ID = randomUUID().slice(0, 8);
 const FOLDER = "notes";
@@ -59,15 +60,12 @@ network policy — and now they're readable on the phone too.
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function commitFolder(client, ctx, files, message) {
-	const head = await client.branchHead(ctx.owner, ctx.repo, ctx.branch);
 	const entries = [];
 	for (const [relative, content] of Object.entries(files)) {
 		const sha = content === null ? null : await client.createBlob(ctx.owner, ctx.repo, Buffer.from(content, "utf8"));
 		entries.push({ path: `${FOLDER}/${relative}`, mode: "100644", type: "blob", sha });
 	}
-	const tree = await client.createTree(ctx.owner, ctx.repo, head, entries);
-	const commit = await client.createCommit(ctx.owner, ctx.repo, message, tree, [head]);
-	await client.updateRef(ctx.owner, ctx.repo, ctx.branch, commit);
+	const commit = await commitEntries(client, ctx, entries, message);
 	await waitFor(async () => (await client.branchHead(ctx.owner, ctx.repo, ctx.branch)) === commit, 15000, "new head");
 }
 
