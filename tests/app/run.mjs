@@ -85,8 +85,16 @@ async function remoteFiles(client, ctx, folder) {
 		.sort();
 }
 
+/**
+ * A file at the branch tip. GitHub's reads can lag a just-pushed commit by a
+ * moment, so a 404 is retried briefly before it counts.
+ */
 const readRemote = (client, ctx, folder, relative) =>
-	client.readFile(ctx.owner, ctx.repo, `${folder}/${relative}`);
+	waitFor(
+		() => client.readFile(ctx.owner, ctx.repo, `${folder}/${relative}`),
+		15000,
+		`${relative} to be readable on GitHub`,
+	);
 
 const exists = (root, relative) =>
 	fs
@@ -189,6 +197,16 @@ async function runSuite({ page, client, accessToken, ctx, folder, vaultRoot, mod
 			60000,
 			"sync to finish",
 		);
+		// Reads right after a push can briefly see the previous head; wait until
+		// GitHub reports the commit the plugin ended on.
+		const synced = await page.eval(`${P}.local.syncState?.commit ?? ""`);
+		if (synced) {
+			await waitFor(
+				async () => (await client.branchHead(ctx.owner, ctx.repo, ctx.branch)) === synced,
+				15000,
+				"GitHub to show the pushed commit",
+			);
+		}
 	};
 	/** Wait until Obsidian's vault index sees a file the plugin wrote behind its back. */
 	const indexed = (relative) =>
