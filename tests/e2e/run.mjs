@@ -126,10 +126,25 @@ async function makeVault(engine, client, ctx, name) {
 }
 
 /** Pull then push, the way the plugin's sync command does. */
+/**
+ * Push the way the plugin does: if the branch moved since the last pull, pull
+ * and try again. CI runs other suites against the same branch concurrently
+ * (in other folders), so a lone push can report a race that has nothing to do
+ * with the test.
+ */
+async function settledPush(sync, state) {
+	for (let attempt = 1; ; attempt++) {
+		const pushed = await sync.push(state);
+		if (!pushed.report.raced || attempt >= 5) return pushed;
+		const plan = await sync.plan(state);
+		state = (await sync.apply(plan, state)).state;
+	}
+}
+
 async function pullThenPush(sync, state) {
 	const plan = await sync.plan(state);
 	const pulled = await sync.apply(plan, state);
-	const pushed = await sync.push(pulled.state);
+	const pushed = await settledPush(sync, pulled.state);
 	return { plan, pull: pulled.report, push: pushed.report, state: pushed.state };
 }
 
@@ -239,7 +254,7 @@ async function run(engine, client, ctx) {
 		assertEqual(plan.writes.length, 0, "writes");
 		assertEqual(plan.deletes.length, 0, "deletes");
 
-		const { report } = await a.sync.push(stateA);
+		const { report } = await settledPush(a.sync, stateA);
 		assertEqual(report.uploaded.length, 0, "nothing to upload");
 		assertEqual(report.commit, null, "no commit for an empty push");
 		assertEqual(report.raced, false, "not raced");
@@ -250,7 +265,7 @@ async function run(engine, client, ctx) {
 		await write(a.root, "Note.md", "# Note\nlocally edited\n");
 		await fs.rm(path.join(a.root, "Added.md"));
 
-		const { report, state } = await a.sync.push(stateA);
+		const { report, state } = await settledPush(a.sync, stateA);
 		stateA = state;
 
 		assertEqual(report.blocked, null, "should not be blocked");
@@ -306,7 +321,7 @@ async function run(engine, client, ctx) {
 		assertEqual(await read(a.root, "Local.md"), "device B's version\n", "canonical path takes remote");
 		assertEqual(report.skippedLocalEdits.length, 0, "nothing should be skipped");
 
-		const pushed = await a.sync.push(stateA);
+		const pushed = await settledPush(a.sync, stateA);
 		stateA = pushed.state;
 		assertEqual(pushed.report.uploaded.join(","), copy, "conflict copy is pushed");
 
@@ -326,7 +341,7 @@ async function run(engine, client, ctx) {
 
 		await fs.rm(path.join(a.root, "bulk"), { recursive: true });
 
-		const { report } = await a.sync.push(stateA);
+		const { report } = await settledPush(a.sync, stateA);
 		assert(report.blocked, "bulk deletion should be blocked");
 		assertEqual(report.commit, null, "blocked push must not commit");
 		assertEqual((await remoteFiles(client, ctx)).length, 23, "remote must be intact");
