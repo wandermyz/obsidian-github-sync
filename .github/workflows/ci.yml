@@ -97,10 +97,14 @@ jobs:
           xattr -dr com.apple.quarantine /Applications/Obsidian.app || true
       - if: env.E2E_TOKEN != ''
         run: npm run test:app
+      # For debugging a failure. Only then: unlike docs/screenshots, these
+      # aren't redacted, and artifacts on a public repo are readable by anyone.
       - name: Upload screenshots
-        if: always() && env.E2E_TOKEN != ''
+        if: failure() && env.E2E_TOKEN != ''
         uses: actions/upload-artifact@v7
         with:
           name: app-test-screenshots
           path: .e2e-tmp/app-*/screenshots/
+          include-hidden-files: true
+          retention-days: 7
           if-no-files-found: ignore

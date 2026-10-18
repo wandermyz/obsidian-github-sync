@@ -282,7 +282,7 @@ macOS only.
 | --- | --- | --- |
 | Build, lint, unit tests | Ubuntu | `npm run build`, `npm run lint` (Obsidian's own ESLint rules, as used by the community directory review), `npm test` |
 | Sync engine against GitHub | Ubuntu | `npm run test:e2e` |
-| Plugin inside Obsidian | macOS | installs the latest Obsidian release, then `npm run test:app`; screenshots are uploaded as an artifact |
+| Plugin inside Obsidian | macOS | installs the latest Obsidian release, then `npm run test:app`; on failure, its screenshots are kept as an artifact for 7 days |
 
 The last two need credentials for the test repository, configured in the
 repository's **Settings → Secrets and variables → Actions**:
