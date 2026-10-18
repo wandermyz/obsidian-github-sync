@@ -25,6 +25,12 @@ export interface DeviceCodeResponse {
 	interval: number;
 }
 
+/** GitHub's OAuth endpoints report failures in the body, often with HTTP 200. */
+interface OAuthError {
+	error?: string;
+	error_description?: string;
+}
+
 export interface AccessTokenResponse {
 	access_token: string;
 	token_type: string;
@@ -58,7 +64,7 @@ export async function refreshAccessToken(
 		}),
 		throw: false,
 	});
-	const json = res.json ?? {};
+	const json = (res.json ?? {}) as Partial<AccessTokenResponse> & OAuthError;
 	if (!json.access_token) {
 		throw new Error(
 			json.error_description ?? json.error ?? `Token refresh failed (HTTP ${res.status})`,
@@ -83,7 +89,7 @@ export async function requestDeviceCode(
 		body: JSON.stringify({ client_id: clientId, scope }),
 		throw: false,
 	});
-	const json = res.json ?? {};
+	const json = (res.json ?? {}) as Partial<DeviceCodeResponse> & OAuthError;
 	if (res.status >= 400 || json.error) {
 		throw new Error(
 			json.error_description ?? json.error ?? `Device code request failed (HTTP ${res.status})`,
@@ -109,7 +115,7 @@ async function pollOnce(
 		}),
 		throw: false,
 	});
-	const json = res.json ?? {};
+	const json = (res.json ?? {}) as Partial<AccessTokenResponse> & OAuthError;
 	if (json.access_token) return { token: json as AccessTokenResponse };
 
 	switch (json.error) {

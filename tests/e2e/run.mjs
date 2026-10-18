@@ -64,7 +64,7 @@ async function bootstrapBranch(token, ctx) {
 			body: JSON.stringify({
 				message: "Initialize test vault repository",
 				content: Buffer.from(
-					"# obsidian-github-sync test vault\n\nScratch repo for the e2e suite. Contents are expendable.\n",
+					"# github-enterprise-sync test vault\n\nScratch repo for the e2e suite. Contents are expendable.\n",
 					"utf8",
 				).toString("base64"),
 				branch: ctx.branch,
@@ -150,7 +150,7 @@ const exists = (root, relative) =>
 
 async function main() {
 	const config = await loadConfig();
-	console.log(`\nobsidian-github-sync e2e`);
+	console.log(`\ngithub-enterprise-sync e2e`);
 	console.log(`  repo:   ${config.owner}/${config.repo}`);
 	console.log(`  folder: ${REMOTE_FOLDER}`);
 

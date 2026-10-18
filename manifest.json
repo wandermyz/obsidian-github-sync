@@ -1,9 +1,10 @@
 {
-  "id": "obsidian-github-sync",
-  "name": "GitHub Sync",
+  "id": "github-enterprise-sync",
+  "name": "GitHub Enterprise Sync",
   "version": "0.1.1",
-  "minAppVersion": "1.5.0",
-  "description": "Sync notes with GitHub (including GitHub Enterprise) using the REST API. Works on mobile.",
+  "minAppVersion": "1.13.0",
+  "description": "Sync notes with GitHub or GitHub Enterprise Server through the GitHub REST API, with no Git binary required. Signs in with OAuth device flow, so it works with enterprise SSO and on mobile, including iOS.",
   "author": "wandermyz",
+  "authorUrl": "https://github.com/wandermyz",
   "isDesktopOnly": false
 }

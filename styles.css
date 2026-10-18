@@ -1,0 +1,18 @@
+/* Device-flow sign-in modal. */
+
+.github-enterprise-sync-device-code {
+	font-size: 2em;
+	font-weight: 700;
+	letter-spacing: 0.15em;
+	text-align: center;
+	margin: 0.5em 0;
+	user-select: text;
+}
+
+.github-enterprise-sync-device-status {
+	color: var(--text-muted);
+}
+
+.github-enterprise-sync-device-status.mod-error {
+	color: var(--text-error);
+}

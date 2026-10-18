@@ -13,7 +13,7 @@ const SHA_B = "b".repeat(40);
 const HEAD = "c".repeat(40);
 
 /** A vault adapter that does nothing; plan() never touches the disk. */
-const vault = { adapter: {} };
+const vault = { adapter: {}, configDir: ".obsidian", getFileByPath: () => null };
 
 const OPTS = {
 	owner: "o",
@@ -110,6 +110,21 @@ test("a normal diff still plans incrementally", async (engine) => {
 	assert.equal(plan.mode, "incremental");
 	assert.deepEqual(plan.writes, [{ path: "notes/a.md", blobSha: SHA_A }]);
 	assert.deepEqual(plan.deletes, ["notes/gone.md"]);
+});
+
+test("a renamed config folder is never planned for write", async (engine) => {
+	const client = stubClient({
+		listTree: async () => [
+			{ path: "notes/a.md", sha: SHA_A, size: 1 },
+			// The user moved Obsidian's config out of `.obsidian`; a repo must not
+			// be able to write into the new location either.
+			{ path: ".config/plugins/x/local.json", sha: SHA_B, size: 1 },
+			{ path: "sub/.config/plugins/x/data.json", sha: SHA_B, size: 1 },
+		],
+	});
+
+	const plan = await new engine.SyncEngine({ adapter: {}, configDir: ".config", getFileByPath: () => null }, client, OPTS).plan(null);
+	assert.deepEqual(plan.writes, [{ path: "notes/a.md", blobSha: SHA_A }]);
 });
 
 test("readBlob rejects a malformed sha before issuing a request", async (engine) => {

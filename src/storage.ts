@@ -44,7 +44,7 @@ export const DEFAULT_LOCAL: LocalState = {
 export const LOCAL_FILE = "local.json";
 
 export function localStatePath(plugin: Plugin): string {
-	// manifest.dir is vault-relative, e.g. ".obsidian/plugins/obsidian-github-sync".
+	// manifest.dir is vault-relative, e.g. ".obsidian/plugins/github-enterprise-sync".
 	return normalizePath(`${plugin.manifest.dir}/${LOCAL_FILE}`);
 }
 
@@ -53,11 +53,11 @@ export async function loadLocalState(plugin: Plugin): Promise<LocalState> {
 	const adapter = plugin.app.vault.adapter;
 	if (!(await adapter.exists(path))) return { ...DEFAULT_LOCAL };
 	try {
-		return { ...DEFAULT_LOCAL, ...JSON.parse(await adapter.read(path)) };
+		return { ...DEFAULT_LOCAL, ...(JSON.parse(await adapter.read(path)) as Partial<LocalState>) };
 	} catch (err) {
 		// A corrupt file must not brick the plugin — the worst case is signing in
 		// again and re-syncing, both recoverable.
-		console.error("[github-sync] could not read local state; starting fresh", err);
+		console.error("[github-enterprise-sync] could not read local state; starting fresh", err);
 		return { ...DEFAULT_LOCAL };
 	}
 }
