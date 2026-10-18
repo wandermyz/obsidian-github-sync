@@ -1,0 +1,74 @@
+name: Release
+
+# Push a tag matching the manifest version (e.g. `git tag 0.3.1 && git push
+# origin 0.3.1`). The assets are built here, from the tagged commit, and get
+# signed build-provenance attestations, so anyone can check that a release's
+# main.js came from this repository:
+#
+#   gh attestation verify main.js --repo wandermyz/obsidian-github-sync
+#
+# The release is created as a draft for a human to review the notes and
+# publish. Tags with a suffix (0.3.1-rc.1) make a draft pre-release, for
+# trying the workflow without touching a real version.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the attestation
+      attestations: write # store it
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Check the tag matches manifest.json
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version=$(node -p 'require("./manifest.json").version')
+          if [ "${tag%%-*}" != "$version" ]; then
+            echo "::error::Tag $tag doesn't match manifest.json version $version."
+            exit 1
+          fi
+          # Obsidian installs the release whose tag equals manifest.json's
+          # version, and looks up its minAppVersion in versions.json.
+          # shellcheck disable=SC2016 # ${...} below is JavaScript, not shell
+          node -e '
+            const v = require("./versions.json"), m = require("./manifest.json");
+            if (v[m.version] !== m.minAppVersion) {
+              console.error(`::error::versions.json has no entry "${m.version}": "${m.minAppVersion}".`);
+              process.exit(1);
+            }'
+
+      - run: npm run build
+      - run: npm run lint
+      - run: npm test
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          prerelease=()
+          [ "$tag" != "${tag%%-*}" ] && prerelease=(--prerelease)
+          gh release create "$tag" main.js manifest.json styles.css \
+            --draft "${prerelease[@]}" --verify-tag --title "$tag" --generate-notes
