@@ -153,6 +153,10 @@ connection to sign you in and to read and write the repository you sync with.
   repository: the files in the synced folder and commit metadata.
 - **No telemetry, no third parties.** Nothing is sent anywhere other than the
   GitHub host you configure. There are no analytics, ads, or tracking.
+- **Clipboard: write only, on request.** The sign-in dialog's **Copy code**
+  button puts the one-time device code on the clipboard so you can paste it
+  into GitHub. That is the plugin's only clipboard use; it never reads the
+  clipboard.
 - **Credentials stay on the device.** Tokens are stored in the plugin's
   `local.json` and never synced or committed (see
   [Where state is stored](#where-state-is-stored)).
@@ -324,6 +328,24 @@ repository's **Settings → Secrets and variables → Actions**:
 Without `E2E_TOKEN` — including on pull requests from forks — those jobs skip
 instead of failing. Locally, the same variables override `.env.e2e`, and
 `E2E_TOKEN` replaces the cached device-flow token.
+
+## Releasing
+
+1. Bump `version` in `manifest.json` and `package.json`, and add the version
+   to `versions.json` with its `minAppVersion`.
+2. Commit, then tag that commit with the bare version and push the tag:
+   `git tag 0.3.1 && git push origin 0.3.1`.
+3. `.github/workflows/release.yml` checks the tag against the manifest,
+   builds, lints, tests, attests `main.js`, `manifest.json`, and `styles.css`,
+   and creates a draft release with them attached. Edit the notes and publish.
+
+Every release asset carries a signed
+[build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds),
+so you can check it was built from this repository by this workflow:
+
+```bash
+gh attestation verify main.js --repo wandermyz/obsidian-github-sync
+```
 
 ## Build and install
 
