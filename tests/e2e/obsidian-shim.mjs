@@ -8,12 +8,16 @@
  * reimplementation of Obsidian.
  *
  * The one behaviour worth mirroring carefully is `DataAdapter`: the engine
- * chose the adapter over the Vault API precisely because it is filesystem-first
- * (see the comment on SyncEngine.writeFile), and these tests would be worthless
- * if the shim quietly restored index-like semantics.
+ * falls back to it precisely because it is filesystem-first (see the comment on
+ * SyncEngine.writeFile), and these tests would be worthless if the shim quietly
+ * restored index-like semantics.
  */
 import fs from "node:fs/promises";
 import path from "node:path";
+
+// Plugin code uses `window.setTimeout` (popout-safe in Obsidian); in Node the
+// global object stands in for the window.
+globalThis.window ??= globalThis;
 
 export function normalizePath(p) {
 	return p.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/|\/$/g, "");

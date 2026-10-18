@@ -156,6 +156,42 @@ test("GitHub Apps and OAuth apps are told apart by client ID", async (engine) =>
 	assert.equal(engine.isGitHubApp("0123456789abcdef0123"), false, "legacy OAuth app IDs are hex");
 });
 
+const lagError = (message) => Object.assign(new Error(`GitHub API 422 on /git/commits: ${message}`), { status: 422 });
+
+test("a write GitHub hasn't replicated yet is retried", async (engine) => {
+	let calls = 0;
+	const result = await engine.retryOnLag(async () => {
+		if (++calls < 3) throw lagError("Tree SHA does not exist");
+		return "commit-sha";
+	}, [0, 0, 0]);
+	assert.equal(result, "commit-sha");
+	assert.equal(calls, 3);
+});
+
+test("a rejected fast-forward is not mistaken for lag", async (engine) => {
+	let calls = 0;
+	await assert.rejects(
+		engine.retryOnLag(async () => {
+			calls++;
+			throw lagError("Update is not a fast forward");
+		}, [0, 0, 0]),
+		/not a fast forward/,
+	);
+	assert.equal(calls, 1, "the push's race detection depends on seeing this at once");
+});
+
+test("lag retries give up eventually", async (engine) => {
+	let calls = 0;
+	await assert.rejects(
+		engine.retryOnLag(async () => {
+			calls++;
+			throw lagError("Tree SHA does not exist");
+		}, [0, 0]),
+		/does not exist/,
+	);
+	assert.equal(calls, 3);
+});
+
 const engine = await loadEngine();
 let failed = 0;
 

@@ -46,6 +46,31 @@ export function errorStatus(err: unknown): number | undefined {
 }
 
 /**
+ * GitHub's git database is replicated, and a write can briefly be invisible to
+ * the next request: createCommit right after createTree has failed with 422
+ * "Tree SHA does not exist". That kind of 422 is retried after a short wait.
+ * Any other 422, notably a ref update that isn't a fast-forward, is real and
+ * passes straight through: the push depends on seeing those.
+ */
+const LAG_RETRY_DELAYS_MS = [500, 1000, 2000];
+
+export function isReplicationLag(err: unknown): boolean {
+	if (errorStatus(err) !== 422 || !(err instanceof Error)) return false;
+	return /does not exist|not a valid (blob|tree|object)/i.test(err.message);
+}
+
+export async function retryOnLag<T>(fn: () => Promise<T>, delaysMs = LAG_RETRY_DELAYS_MS): Promise<T> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await fn();
+		} catch (err) {
+			if (attempt >= delaysMs.length || !isReplicationLag(err)) throw err;
+			await new Promise((resolve) => window.setTimeout(resolve, delaysMs[attempt]));
+		}
+	}
+}
+
+/**
  * One entry in a tree we're about to create. `sha: null` deletes the path;
  * `content` uploads inline text without a separate blob request.
  */
@@ -236,10 +261,12 @@ export class GitHubClient {
 		baseTree: string,
 		entries: TreeEntry[],
 	): Promise<string> {
-		const json = await this.request<{ sha: string }>("POST", `/repos/${owner}/${repo}/git/trees`, {
-			base_tree: baseTree,
-			tree: entries,
-		});
+		const json = await retryOnLag(() =>
+			this.request<{ sha: string }>("POST", `/repos/${owner}/${repo}/git/trees`, {
+				base_tree: baseTree,
+				tree: entries,
+			}),
+		);
 		return json.sha;
 	}
 
@@ -250,11 +277,13 @@ export class GitHubClient {
 		treeSha: string,
 		parents: string[],
 	): Promise<string> {
-		const json = await this.request<{ sha: string }>("POST", `/repos/${owner}/${repo}/git/commits`, {
-			message,
-			tree: treeSha,
-			parents,
-		});
+		const json = await retryOnLag(() =>
+			this.request<{ sha: string }>("POST", `/repos/${owner}/${repo}/git/commits`, {
+				message,
+				tree: treeSha,
+				parents,
+			}),
+		);
 		return json.sha;
 	}
 
@@ -266,9 +295,12 @@ export class GitHubClient {
 	 * head instead of clobbering their commit.
 	 */
 	async updateRef(owner: string, repo: string, branch: string, commitSha: string) {
-		await this.request<unknown>("PATCH", `/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
-			sha: commitSha,
-			force: false,
-		});
+		// A non-fast-forward 422 isn't lag, so retryOnLag lets it through.
+		await retryOnLag(() =>
+			this.request<unknown>("PATCH", `/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
+				sha: commitSha,
+				force: false,
+			}),
+		);
 	}
 }
