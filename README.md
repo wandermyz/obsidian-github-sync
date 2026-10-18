@@ -1,5 +1,8 @@
 # GitHub Enterprise Sync
 
+[![CI](https://github.com/wandermyz/obsidian-github-sync/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/wandermyz/obsidian-github-sync/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/wandermyz/obsidian-github-sync?sort=semver)](https://github.com/wandermyz/obsidian-github-sync/releases/latest)
+
 An Obsidian plugin that syncs notes with a GitHub repository — including GitHub
 Enterprise Server — over the **GitHub REST API**. There is no Git
 implementation in JavaScript and no native code, so it works on mobile,
