@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The e2e and app jobs talk to a real repository. They work in per-run
+# folders, so overlapping runs are safe, but there's no point testing a
+# commit that's already been superseded on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Build, lint, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      - run: npm test
+
+  # Tests below need a token for the test repository (secret E2E_TOKEN) and
+  # the repo/app to use (variables E2E_REPO, E2E_CLIENT_ID). Pull requests from
+  # forks don't get secrets, so these skip there rather than fail.
+
+  e2e:
+    name: Sync engine against GitHub
+    needs: checks
+    runs-on: ubuntu-latest
+    env:
+      E2E_TOKEN: ${{ secrets.E2E_TOKEN }}
+      E2E_REPO: ${{ vars.E2E_REPO }}
+      E2E_CLIENT_ID: ${{ vars.E2E_CLIENT_ID }}
+    steps:
+      - name: Skip without credentials
+        if: env.E2E_TOKEN == ''
+        run: echo "::notice::E2E_TOKEN is not set; skipping the e2e tests."
+      - uses: actions/checkout@v7
+        if: env.E2E_TOKEN != ''
+      - uses: actions/setup-node@v7
+        if: env.E2E_TOKEN != ''
+        with:
+          node-version: 22
+          cache: npm
+      - if: env.E2E_TOKEN != ''
+        run: npm ci
+      - if: env.E2E_TOKEN != ''
+        run: npm run test:e2e
+
+  app:
+    name: Plugin inside Obsidian (desktop + emulated phone)
+    needs: checks
+    # Obsidian is driven through macOS (open, osascript); the runners have a
+    # logged-in GUI session, so the app can launch.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      E2E_TOKEN: ${{ secrets.E2E_TOKEN }}
+      E2E_REPO: ${{ vars.E2E_REPO }}
+      E2E_CLIENT_ID: ${{ vars.E2E_CLIENT_ID }}
+    steps:
+      - name: Skip without credentials
+        if: env.E2E_TOKEN == ''
+        run: echo "::notice::E2E_TOKEN is not set; skipping the app tests."
+      - uses: actions/checkout@v7
+        if: env.E2E_TOKEN != ''
+      - uses: actions/setup-node@v7
+        if: env.E2E_TOKEN != ''
+        with:
+          node-version: 22
+          cache: npm
+      - if: env.E2E_TOKEN != ''
+        run: npm ci
+      - name: Install Obsidian
+        if: env.E2E_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo obsidianmd/obsidian-releases --pattern 'Obsidian-*.dmg' --dir "$RUNNER_TEMP"
+          dmg=$(echo "$RUNNER_TEMP"/Obsidian-*.dmg)
+          echo "Installing $(basename "$dmg")"
+          mount=$(hdiutil attach "$dmg" -nobrowse -noautoopen | tail -1 | cut -f3-)
+          cp -R "$mount/Obsidian.app" /Applications/
+          hdiutil detach "$mount"
+          xattr -dr com.apple.quarantine /Applications/Obsidian.app || true
+      - if: env.E2E_TOKEN != ''
+        run: npm run test:app
+      - name: Upload screenshots
+        if: always() && env.E2E_TOKEN != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-test-screenshots
+          path: .e2e-tmp/app-*/screenshots/
+          if-no-files-found: ignore
