@@ -20,6 +20,12 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 const PORT = 9222;
+/**
+ * Launched by path where possible: `open -a Obsidian` resolves the name through
+ * Launch Services, which may not have registered a freshly installed copy yet.
+ */
+const APP = "/Applications/Obsidian.app";
+const appTarget = () => fs.access(APP).then(() => APP, () => "Obsidian");
 const CONFIG = path.join(os.homedir(), "Library/Application Support/obsidian/obsidian.json");
 export const PLUGIN_ID = "github-enterprise-sync";
 
@@ -63,7 +69,7 @@ export async function launch(vaultPath) {
 	config.vaults[id] = { path: vaultPath, ts: Date.now(), open: true };
 	await fs.writeFile(CONFIG, JSON.stringify(config));
 
-	await run("open", ["-a", "Obsidian", "--args", `--remote-debugging-port=${PORT}`]);
+	await run("open", ["-a", await appTarget(), "--args", `--remote-debugging-port=${PORT}`]);
 	const page = await waitFor(async () => {
 		const list = await (await fetch(`http://localhost:${PORT}/json/list`)).json();
 		const target = list.find((t) => t.type === "page");
@@ -108,7 +114,7 @@ export async function restore() {
 		savedConfig = null;
 	}
 	// On a CI runner there's nobody to give Obsidian back to.
-	if (!process.env.CI) await run("open", ["-a", "Obsidian"]);
+	if (!process.env.CI) await run("open", ["-a", await appTarget()]);
 }
 
 export async function waitFor(fn, timeoutMs, what) {

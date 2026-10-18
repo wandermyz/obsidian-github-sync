@@ -95,6 +95,7 @@ jobs:
           cp -R "$mount/Obsidian.app" /Applications/
           hdiutil detach "$mount"
           xattr -dr com.apple.quarantine /Applications/Obsidian.app || true
+          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Obsidian.app
       - if: env.E2E_TOKEN != ''
         run: npm run test:app
       # For debugging a failure. Only then: unlike docs/screenshots, these
