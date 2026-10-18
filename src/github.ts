@@ -57,21 +57,29 @@ export interface TreeEntry {
 	content?: string;
 }
 
+/**
+ * GitHub answers API reads with `Cache-Control: private, max-age=60`, and
+ * Obsidian's requestUrl honours it: without this, a branch lookup made within a
+ * minute of the last one returns the old head, so a sync silently misses
+ * commits pushed from another device. `no-cache` makes every read revalidate.
+ */
+const NO_CACHE = { "Cache-Control": "no-cache" };
+
 export class GitHubClient {
 	constructor(
 		private host: GitHubHost,
 		private token: string,
 	) {}
 
-	private async api(path: string): Promise<any> {
-		return this.request("GET", path);
+	private async api<T>(path: string): Promise<T> {
+		return this.request<T>("GET", path);
 	}
 
-	private async request(
+	private async request<T>(
 		method: "GET" | "POST" | "PATCH",
 		path: string,
 		body?: unknown,
-	): Promise<any> {
+	): Promise<T> {
 		const res = await requestUrl({
 			url: `${this.host.apiBase}${path}`,
 			method,
@@ -79,30 +87,31 @@ export class GitHubClient {
 				Authorization: `Bearer ${this.token}`,
 				Accept: "application/vnd.github+json",
 				"X-GitHub-Api-Version": "2022-11-28",
+				...NO_CACHE,
 				...(body === undefined ? {} : { "Content-Type": "application/json" }),
 			},
 			body: body === undefined ? undefined : JSON.stringify(body),
 			throw: false,
 		});
 		if (res.status >= 400) {
-			const message = res.json?.message ?? res.text ?? "";
+			const message = (res.json as { message?: string } | undefined)?.message ?? res.text ?? "";
 			const err = new Error(`GitHub API ${res.status} on ${path}: ${message}`);
 			(err as GitHubError).status = res.status;
 			throw err;
 		}
-		return res.json;
+		return res.json as T;
 	}
 
 	/** The authenticated user's login — the cheapest proof the token works. */
 	async currentUser(): Promise<{ login: string; name: string | null }> {
-		return this.api("/user");
+		return this.api<{ login: string; name: string | null }>("/user");
 	}
 
 	async listDirectory(owner: string, repo: string, dirPath = ""): Promise<RepoEntry[]> {
 		const suffix = dirPath ? `/${encodeURI(dirPath.replace(/^\/+/, ""))}` : "";
-		const json = await this.api(`/repos/${owner}/${repo}/contents${suffix}`);
+		const json = await this.api<RepoEntry[] | RepoEntry>(`/repos/${owner}/${repo}/contents${suffix}`);
 		if (!Array.isArray(json)) throw new Error(`${dirPath || "/"} is a file, not a directory.`);
-		return json as RepoEntry[];
+		return json;
 	}
 
 	/** Read a text file's contents. Uses the raw media type, so no base64 decode. */
@@ -114,6 +123,7 @@ export class GitHubClient {
 				Authorization: `Bearer ${this.token}`,
 				Accept: "application/vnd.github.raw+json",
 				"X-GitHub-Api-Version": "2022-11-28",
+				...NO_CACHE,
 			},
 			throw: false,
 		});
@@ -123,13 +133,15 @@ export class GitHubClient {
 
 	/** Resolve a branch name to its current head commit SHA. */
 	async branchHead(owner: string, repo: string, branch: string): Promise<string> {
-		const json = await this.api(`/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`);
+		const json = await this.api<{ commit: { sha: string } }>(
+			`/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`,
+		);
 		return json.commit.sha;
 	}
 
 	/** The repo's default branch, used when the user hasn't picked one. */
 	async defaultBranch(owner: string, repo: string): Promise<string> {
-		const json = await this.api(`/repos/${owner}/${repo}`);
+		const json = await this.api<{ default_branch: string }>(`/repos/${owner}/${repo}`);
 		return json.default_branch;
 	}
 
@@ -138,15 +150,16 @@ export class GitHubClient {
 	 * fallback when a diff is unusable.
 	 */
 	async listTree(owner: string, repo: string, commitSha: string): Promise<TreeBlob[]> {
-		const json = await this.api(
-			`/repos/${owner}/${repo}/git/trees/${commitSha}?recursive=1`,
-		);
+		const json = await this.api<{
+			truncated: boolean;
+			tree: { path: string; type: string; sha: string; size?: number }[];
+		}>(`/repos/${owner}/${repo}/git/trees/${commitSha}?recursive=1`);
 		if (json.truncated) {
 			throw new Error(
 				"Repository tree exceeds GitHub's listing limit — too large to sync as a single tree.",
 			);
 		}
-		return (json.tree as any[])
+		return json.tree
 			.filter((e) => e.type === "blob")
 			.map((e) => ({ path: e.path, sha: e.sha, size: e.size ?? 0 }));
 	}
@@ -163,10 +176,10 @@ export class GitHubClient {
 		base: string,
 		head: string,
 	): Promise<CompareResult> {
-		const json = await this.api(
+		const json = await this.api<{ status: string; files?: CompareFile[]; total_commits?: number }>(
 			`/repos/${owner}/${repo}/compare/${base}...${head}?per_page=300`,
 		);
-		const files = (json.files ?? []) as CompareFile[];
+		const files = json.files ?? [];
 		return {
 			status: json.status,
 			files,
@@ -189,7 +202,9 @@ export class GitHubClient {
 		if (!/^[0-9a-f]{40}$/.test(blobSha ?? "")) {
 			throw new Error(`Refusing to fetch a blob with a malformed SHA: ${JSON.stringify(blobSha)}`);
 		}
-		const json = await this.api(`/repos/${owner}/${repo}/git/blobs/${blobSha}`);
+		const json = await this.api<{ encoding: string; content: string }>(
+			`/repos/${owner}/${repo}/git/blobs/${blobSha}`,
+		);
 		if (json.encoding !== "base64") {
 			throw new Error(`Unexpected blob encoding "${json.encoding}" for ${blobSha}`);
 		}
@@ -204,11 +219,11 @@ export class GitHubClient {
 	 * that don't survive a JSON round-trip intact.
 	 */
 	async createBlob(owner: string, repo: string, content: ArrayBuffer): Promise<string> {
-		const json = await this.request("POST", `/repos/${owner}/${repo}/git/blobs`, {
+		const json = await this.request<{ sha: string }>("POST", `/repos/${owner}/${repo}/git/blobs`, {
 			content: bytesToBase64(content),
 			encoding: "base64",
 		});
-		return json.sha as string;
+		return json.sha;
 	}
 
 	/**
@@ -221,11 +236,11 @@ export class GitHubClient {
 		baseTree: string,
 		entries: TreeEntry[],
 	): Promise<string> {
-		const json = await this.request("POST", `/repos/${owner}/${repo}/git/trees`, {
+		const json = await this.request<{ sha: string }>("POST", `/repos/${owner}/${repo}/git/trees`, {
 			base_tree: baseTree,
 			tree: entries,
 		});
-		return json.sha as string;
+		return json.sha;
 	}
 
 	async createCommit(
@@ -235,12 +250,12 @@ export class GitHubClient {
 		treeSha: string,
 		parents: string[],
 	): Promise<string> {
-		const json = await this.request("POST", `/repos/${owner}/${repo}/git/commits`, {
+		const json = await this.request<{ sha: string }>("POST", `/repos/${owner}/${repo}/git/commits`, {
 			message,
 			tree: treeSha,
 			parents,
 		});
-		return json.sha as string;
+		return json.sha;
 	}
 
 	/**
@@ -251,7 +266,7 @@ export class GitHubClient {
 	 * head instead of clobbering their commit.
 	 */
 	async updateRef(owner: string, repo: string, branch: string, commitSha: string) {
-		await this.request("PATCH", `/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
+		await this.request<unknown>("PATCH", `/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
 			sha: commitSha,
 			force: false,
 		});

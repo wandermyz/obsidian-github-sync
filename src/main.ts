@@ -1,4 +1,13 @@
-import { App, Notice, Platform, Plugin, PluginSettingTab, Setting } from "obsidian";
+import {
+	App,
+	ButtonComponent,
+	Notice,
+	Platform,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	SettingDefinitionItem,
+} from "obsidian";
 import { AccessTokenResponse, GitHubHost, hostFromWebBase, refreshAccessToken } from "./auth";
 import { DeviceFlowModal } from "./deviceFlowModal";
 import { GitHubClient } from "./github";
@@ -53,7 +62,7 @@ const STARTUP_SYNC_DELAY_MS = 3000;
  */
 const PUSH_RETRY_LIMIT = 3;
 
-export default class GitHubSyncPlugin extends Plugin {
+export default class GitHubEnterpriseSyncPlugin extends Plugin {
 	settings: Settings = { ...DEFAULT_SETTINGS };
 	/** Credentials and per-device sync state; never written to data.json. */
 	local: LocalState = { ...DEFAULT_LOCAL };
@@ -66,7 +75,7 @@ export default class GitHubSyncPlugin extends Plugin {
 	 * device flow, a sync completing) can redraw it instead of leaving stale
 	 * text until the user navigates away and back.
 	 */
-	settingTab: GitHubSyncSettingTab | null = null;
+	settingTab: GitHubEnterpriseSyncSettingTab | null = null;
 
 	/** Redraw the settings tab if it is currently on screen. */
 	refreshSettingsTab() {
@@ -75,7 +84,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
-		this.settingTab = new GitHubSyncSettingTab(this.app, this);
+		this.settingTab = new GitHubEnterpriseSyncSettingTab(this.app, this);
 		this.addSettingTab(this.settingTab);
 		this.statusBar = this.addStatusBarItem();
 		this.renderStatusBar();
@@ -159,7 +168,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
 	signIn() {
 		if (!this.settings.clientId) {
-			new Notice("Set the OAuth app Client ID in settings first.");
+			new Notice("Set the OAuth app client ID in settings first.");
 			return;
 		}
 		new DeviceFlowModal(
@@ -167,14 +176,16 @@ export default class GitHubSyncPlugin extends Plugin {
 			this.host,
 			this.settings.clientId,
 			this.settings.scope,
-			async (token) => {
-				await this.storeToken(token);
-				// Redraw before verifying: verification hits the network, and the
-				// button should already read "Re-authenticate" by then.
-				this.refreshSettingsTab();
-				await this.verifyAccess();
-			},
+			(token) => void this.onSignedIn(token),
 		).open();
+	}
+
+	private async onSignedIn(token: AccessTokenResponse) {
+		await this.storeToken(token);
+		// Redraw before verifying: verification hits the network, and the
+		// button should already read "Re-authenticate" by then.
+		this.refreshSettingsTab();
+		await this.verifyAccess();
 	}
 
 	/** Persist a token response, recording expiry when the app uses expiring tokens. */
@@ -209,7 +220,7 @@ export default class GitHubSyncPlugin extends Plugin {
 			await this.storeToken(renewed);
 			return renewed.access_token;
 		} catch (err) {
-			console.error("[github-sync] refresh failed", err);
+			console.error("[github-enterprise-sync] refresh failed", err);
 			return "";
 		}
 	}
@@ -240,7 +251,6 @@ export default class GitHubSyncPlugin extends Plugin {
 
 			const dir = this.settings.remoteFolder.trim();
 			const entries = await client.listDirectory(owner, repo, dir);
-			console.log(`[github-sync] ${owner}/${repo}/${dir} :`, entries);
 
 			const firstFile = entries.find((e) => e.type === "file");
 			if (!firstFile) {
@@ -248,19 +258,18 @@ export default class GitHubSyncPlugin extends Plugin {
 				return;
 			}
 			const content = await client.readFile(owner, repo, firstFile.path);
-			console.log(`[github-sync] ${firstFile.path} (${content.length} chars):\n${content.slice(0, 500)}`);
 			new Notice(
 				`Read ${firstFile.path} — ${content.length} chars. ${entries.length} entries at ${dir || "root"}.`,
 			);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			console.error("[github-sync]", err);
+			console.error("[github-enterprise-sync]", err);
 			new Notice(`Verification failed: ${message}`, 10000);
 		}
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) as Partial<Settings> | null) };
 		this.local = await loadLocalState(this);
 	}
 
@@ -296,7 +305,7 @@ export default class GitHubSyncPlugin extends Plugin {
 		if (!token) {
 			// Always loud: silence here looks identical to "nothing changed",
 			// and the user needs to know auto-sync has stopped working.
-			new Notice("GitHub Sync: not signed in — sync skipped.");
+			new Notice("GitHub Enterprise Sync: not signed in — sync skipped.");
 			return;
 		}
 
@@ -308,14 +317,19 @@ export default class GitHubSyncPlugin extends Plugin {
 			const branch =
 				this.settings.branch.trim() || (await client.defaultBranch(owner, repo));
 
-			const engine = new SyncEngine(this.app.vault, client, {
-				owner,
-				repo,
-				branch,
-				targetFolder: this.settings.targetFolder.trim(),
-				remoteFolder: this.settings.remoteFolder.trim(),
-				deviceLabel: this.deviceLabel(),
-			});
+			const engine = new SyncEngine(
+				this.app.vault,
+				client,
+				{
+					owner,
+					repo,
+					branch,
+					targetFolder: this.settings.targetFolder.trim(),
+					remoteFolder: this.settings.remoteFolder.trim(),
+					deviceLabel: this.deviceLabel(),
+				},
+				this.app.fileManager,
+			);
 
 			// Pull, then push. Another device can land a commit between the two,
 			// which the push detects via the fast-forward check; the fix is simply
@@ -329,7 +343,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
 				if (attempt >= PUSH_RETRY_LIMIT) {
 					new Notice(
-						"GitHub Sync: the branch kept moving while pushing. Your local changes are safe — try again.",
+						"GitHub Enterprise Sync: the branch kept moving while pushing. Your local changes are safe — try again.",
 						10000,
 					);
 					return;
@@ -337,10 +351,10 @@ export default class GitHubSyncPlugin extends Plugin {
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			console.error("[github-sync] sync failed", err);
+			console.error("[github-enterprise-sync] sync failed", err);
 			// Failures are always surfaced — a silently broken sync is worse
 			// than a noisy one.
-			new Notice(`GitHub Sync failed: ${message}`, 10000);
+			new Notice(`GitHub Enterprise Sync failed: ${message}`, 10000);
 		} finally {
 			this.syncing = false;
 			this.renderStatusBar();
@@ -374,7 +388,7 @@ export default class GitHubSyncPlugin extends Plugin {
 		// disk no longer describes a known commit. Pushing from there could delete
 		// remote files we merely failed to download.
 		if (!newState.commit) {
-			new Notice("GitHub Sync: pull incomplete — skipping upload until it succeeds.", 10000);
+			new Notice("GitHub Enterprise Sync: pull incomplete — skipping upload until it succeeds.", 10000);
 			return false;
 		}
 		return true;
@@ -392,19 +406,18 @@ export default class GitHubSyncPlugin extends Plugin {
 		if (report.raced) return { raced: true };
 
 		if (report.blocked) {
-			new Notice(`GitHub Sync: ${report.blocked}`, 15000);
+			new Notice(`GitHub Enterprise Sync: ${report.blocked}`, 15000);
 			return { raced: false };
 		}
 
 		this.local.syncState = newState;
 		await this.saveLocal();
 
-		console.log("[github-sync] push report", report);
 		if (report.commit) {
 			const parts: string[] = [];
 			if (report.uploaded.length) parts.push(`${report.uploaded.length} uploaded`);
 			if (report.removed.length) parts.push(`${report.removed.length} removed`);
-			new Notice(`GitHub Sync: pushed ${parts.join(", ")}.`);
+			new Notice(`GitHub Enterprise Sync: pushed ${parts.join(", ")}.`);
 		} else if (loud) {
 			new Notice("Nothing local to push.");
 		}
@@ -426,8 +439,6 @@ export default class GitHubSyncPlugin extends Plugin {
 	}
 
 	private reportSync(report: SyncReport, loud: boolean) {
-		console.log("[github-sync] sync report", report);
-
 		const parts: string[] = [];
 		if (report.added) parts.push(`${report.added} added`);
 		if (report.updated) parts.push(`${report.updated} updated`);
@@ -437,14 +448,14 @@ export default class GitHubSyncPlugin extends Plugin {
 		// Problems are always announced, however the sync was triggered.
 		if (report.integrityFailures.length) {
 			new Notice(
-				`GitHub Sync: ${report.integrityFailures.length} file(s) failed verification and will retry next sync:\n` +
+				`GitHub Enterprise Sync: ${report.integrityFailures.length} file(s) failed verification and will retry next sync:\n` +
 					report.integrityFailures.slice(0, 5).join("\n"),
 				15000,
 			);
 		}
 		if (report.conflicts.length) {
 			new Notice(
-				`GitHub Sync: ${report.conflicts.length} file(s) changed both here and remotely. ` +
+				`GitHub Enterprise Sync: ${report.conflicts.length} file(s) changed both here and remotely. ` +
 					`Your version was kept beside the remote one:\n` +
 					report.conflicts.slice(0, 5).join("\n"),
 				15000,
@@ -452,14 +463,14 @@ export default class GitHubSyncPlugin extends Plugin {
 		}
 		if (report.skippedLocalEdits.length) {
 			new Notice(
-				`GitHub Sync: skipped ${report.skippedLocalEdits.length} locally-edited file(s) to avoid overwriting your changes:\n` +
+				`GitHub Enterprise Sync: skipped ${report.skippedLocalEdits.length} locally-edited file(s) to avoid overwriting your changes:\n` +
 					report.skippedLocalEdits.slice(0, 5).join("\n"),
 				15000,
 			);
 		}
 
 		if (loud || report.added || report.updated || report.deleted) {
-			new Notice(`GitHub Sync (${report.mode}): ${summary}.`);
+			new Notice(`GitHub Enterprise Sync (${report.mode}): ${summary}.`);
 		}
 	}
 
@@ -480,69 +491,172 @@ export default class GitHubSyncPlugin extends Plugin {
 	}
 }
 
-class GitHubSyncSettingTab extends PluginSettingTab {
-	/** Only true while the tab is on screen; redrawing a hidden tab is wasted work. */
-	private open = false;
+type SettingKey = keyof Settings;
+
+class GitHubEnterpriseSyncSettingTab extends PluginSettingTab {
+	/**
+	 * Rows whose text reflects runtime state rather than a stored setting.
+	 * Kept so refresh() can rewrite them in place after a sign-in or a sync.
+	 */
+	private accountRow: Setting | null = null;
+	private manualSyncRow: Setting | null = null;
 
 	constructor(
 		app: App,
-		private plugin: GitHubSyncPlugin,
+		private plugin: GitHubEnterpriseSyncPlugin,
 	) {
 		super(app, plugin);
 	}
 
-	hide() {
-		this.open = false;
-		super.hide();
+	/**
+	 * Declarative settings: Obsidian renders them, and indexes them for the
+	 * settings search. Controls read and write `plugin.settings` through
+	 * getControlValue/setControlValue.
+	 */
+	getSettingDefinitions(): SettingDefinitionItem<SettingKey>[] {
+		const s = () => this.plugin.settings;
+		return [
+			{
+				name: "GitHub host",
+				desc: "https://github.com, or your GitHub Enterprise Server URL.",
+				aliases: ["enterprise", "server", "url"],
+				control: {
+					type: "text",
+					key: "githubWebBase",
+					placeholder: "https://github.com",
+					validate: (v) => (/^https:\/\/\S+$/.test(v.trim()) ? undefined : "Must be an https:// URL."),
+				},
+			},
+			{
+				name: "OAuth app client ID",
+				desc: "From the GitHub OAuth app with device flow enabled.",
+				control: { type: "text", key: "clientId", placeholder: "Iv1.xxxxxxxxxxxx" },
+			},
+			{
+				name: "Scopes",
+				desc: "Space-separated OAuth scopes.",
+				control: { type: "text", key: "scope" },
+			},
+			{
+				name: "Account",
+				aliases: ["sign in", "login", "token"],
+				render: (setting) => {
+					this.accountRow = setting;
+					setting.addButton((b) => b.setCta().onClick(() => this.plugin.signIn()));
+					this.renderAccount();
+				},
+			},
+			{
+				type: "group",
+				heading: "Sync",
+				items: [
+					{
+						name: "Repository",
+						desc: "owner/repo to sync notes from.",
+						control: {
+							type: "text",
+							key: "syncRepo",
+							placeholder: "owner/repo",
+							validate: (v) =>
+								!v.trim() || /^[^/\s]+\/[^/\s]+$/.test(v.trim()) ? undefined : "Use the form owner/repo.",
+						},
+					},
+					{
+						name: "Branch",
+						desc: "Leave empty to use the repository's default branch.",
+						control: { type: "text", key: "branch", placeholder: "main" },
+					},
+					{
+						name: "Remote folder",
+						desc: "Only sync this subfolder of the repo. Empty = the whole repo.",
+						control: { type: "text", key: "remoteFolder", placeholder: "notes" },
+					},
+					{
+						name: "Vault folder",
+						desc: "Where the remote files land in this vault. Empty = the vault root.",
+						control: { type: "text", key: "targetFolder", placeholder: "GitHub" },
+					},
+					{
+						name: "Manual sync",
+						aliases: ["sync now", "full resync", "verify access"],
+						render: (setting) => {
+							this.manualSyncRow = setting;
+							setting
+								.addButton((b) =>
+									b
+										.setButtonText("Sync now")
+										.setCta()
+										.onClick(async () => {
+											await this.plugin.sync("manual");
+											this.refresh();
+										}),
+								)
+								.addButton((b) =>
+									b.setButtonText("Full resync").onClick(async () => {
+										await this.plugin.sync("manual", true);
+										this.refresh();
+									}),
+								)
+								.addButton((b) =>
+									b.setButtonText("Verify access").onClick(async () => {
+										await this.plugin.verifyAccess();
+										this.refresh();
+									}),
+								);
+							this.renderManualSync();
+						},
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Automatic sync",
+				items: [
+					{
+						name: "Sync on startup",
+						desc: "Pull changes shortly after Obsidian finishes loading.",
+						control: { type: "toggle", key: "syncOnStartup" },
+					},
+					{
+						name: "Periodic sync",
+						desc: "Pull changes on a timer while Obsidian is open.",
+						control: { type: "toggle", key: "autoSyncEnabled" },
+					},
+					{
+						name: "Sync interval",
+						desc: "Minutes between automatic syncs.",
+						visible: () => s().autoSyncEnabled,
+						control: { type: "number", key: "autoSyncMinutes", placeholder: "15", min: 1, step: 1 },
+					},
+				],
+			},
+		];
 	}
 
-	/** Redraw only if the user is actually looking at this tab. */
+	async setControlValue(key: string, value: unknown) {
+		const settings = this.plugin.settings as unknown as Record<string, unknown>;
+		if (key === "autoSyncMinutes") {
+			const n = Number(value);
+			if (!Number.isFinite(n) || n < 1) return;
+			settings[key] = Math.round(n);
+		} else {
+			settings[key] = typeof value === "string" ? value.trim() : value;
+		}
+		await this.plugin.saveSettings();
+		if (key === "autoSyncEnabled" || key === "autoSyncMinutes") this.plugin.restartAutoSyncTimer();
+		// "Sync interval" is only shown while periodic sync is on.
+		if (key === "autoSyncEnabled") this.refreshDomState();
+	}
+
+	/** Rewrite the state-driven rows, if they're on screen. */
 	refresh() {
-		if (this.open) this.display();
+		this.renderAccount();
+		this.renderManualSync();
 	}
 
-	display() {
-		this.open = true;
-		const { containerEl } = this;
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName("GitHub host")
-			.setDesc("https://github.com, or your GitHub Enterprise Server URL.")
-			.addText((t) =>
-				t
-					.setPlaceholder("https://github.com")
-					.setValue(this.plugin.settings.githubWebBase)
-					.onChange(async (v) => {
-						this.plugin.settings.githubWebBase = v.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("OAuth app Client ID")
-			.setDesc("From the GitHub OAuth app with device flow enabled.")
-			.addText((t) =>
-				t
-					.setPlaceholder("Iv1.xxxxxxxxxxxx")
-					.setValue(this.plugin.settings.clientId)
-					.onChange(async (v) => {
-						this.plugin.settings.clientId = v.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Scopes")
-			.setDesc("Space-separated OAuth scopes.")
-			.addText((t) =>
-				t.setValue(this.plugin.settings.scope).onChange(async (v) => {
-					this.plugin.settings.scope = v.trim();
-					await this.plugin.saveSettings();
-				}),
-			);
-
-		const s = this.plugin.settings;
+	private renderAccount() {
+		const row = this.accountRow;
+		if (!row?.settingEl.isConnected) return;
 		const l = this.plugin.local;
 		let status: string;
 		if (!l.accessToken) {
@@ -560,140 +674,19 @@ class GitHubSyncSettingTab extends PluginSettingTab {
 							: " Token expired — sign in again.";
 			}
 		}
+		row.setDesc(`${status} Stored in ${LOCAL_FILE}, separate from your synced settings.`);
+		const button = row.components.find((c) => c instanceof ButtonComponent);
+		button?.setButtonText(l.accessToken ? "Re-authenticate" : "Sign in");
+	}
 
-		new Setting(containerEl)
-			.setName("Account")
-			.setDesc(`${status} Stored in ${LOCAL_FILE}, separate from your synced settings.`)
-			.addButton((b) =>
-				b
-					.setButtonText(l.accessToken ? "Re-authenticate" : "Sign in")
-					.setCta()
-					.onClick(() => this.plugin.signIn()),
-			);
-
-		new Setting(containerEl).setName("Sync").setHeading();
-
-		new Setting(containerEl)
-			.setName("Repository")
-			.setDesc("owner/repo to sync notes from.")
-			.addText((t) =>
-				t
-					.setPlaceholder("owner/repo")
-					.setValue(s.syncRepo)
-					.onChange(async (v) => {
-						this.plugin.settings.syncRepo = v.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Branch")
-			.setDesc("Leave empty to use the repository's default branch.")
-			.addText((t) =>
-				t
-					.setPlaceholder("main")
-					.setValue(s.branch)
-					.onChange(async (v) => {
-						this.plugin.settings.branch = v.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Remote folder")
-			.setDesc("Only sync this subfolder of the repo. Empty = the whole repo.")
-			.addText((t) =>
-				t
-					.setPlaceholder("notes")
-					.setValue(s.remoteFolder)
-					.onChange(async (v) => {
-						this.plugin.settings.remoteFolder = v.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Vault folder")
-			.setDesc("Where the remote files land in this vault. Empty = the vault root.")
-			.addText((t) =>
-				t
-					.setPlaceholder("GitHub")
-					.setValue(s.targetFolder)
-					.onChange(async (v) => {
-						this.plugin.settings.targetFolder = v.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		const lastSync = l.syncState?.lastSyncedAt
-			? `Last synced ${new Date(l.syncState.lastSyncedAt).toLocaleString()} at ${l.syncState.commit.slice(0, 7)}.`
-			: "Never synced.";
-
-		new Setting(containerEl)
-			.setName("Manual sync")
-			.setDesc(lastSync)
-			.addButton((b) =>
-				b
-					.setButtonText("Sync now")
-					.setCta()
-					.onClick(async () => {
-						await this.plugin.sync("manual");
-						this.refresh();
-					}),
-			)
-			.addButton((b) =>
-				b.setButtonText("Full resync").onClick(async () => {
-					await this.plugin.sync("manual", true);
-					this.refresh();
-				}),
-			)
-			.addButton((b) =>
-				b.setButtonText("Verify access").onClick(async () => {
-					await this.plugin.verifyAccess();
-					this.refresh();
-				}),
-			);
-
-		new Setting(containerEl).setName("Automatic sync").setHeading();
-
-		new Setting(containerEl)
-			.setName("Sync on startup")
-			.setDesc("Pull changes shortly after Obsidian finishes loading.")
-			.addToggle((t) =>
-				t.setValue(s.syncOnStartup).onChange(async (v) => {
-					this.plugin.settings.syncOnStartup = v;
-					await this.plugin.saveSettings();
-				}),
-			);
-
-		new Setting(containerEl)
-			.setName("Periodic sync")
-			.setDesc("Pull changes on a timer while Obsidian is open.")
-			.addToggle((t) =>
-				t.setValue(s.autoSyncEnabled).onChange(async (v) => {
-					this.plugin.settings.autoSyncEnabled = v;
-					await this.plugin.saveSettings();
-					this.plugin.restartAutoSyncTimer();
-					this.refresh();
-				}),
-			);
-
-		if (s.autoSyncEnabled) {
-			new Setting(containerEl)
-				.setName("Sync interval")
-				.setDesc("Minutes between automatic syncs.")
-				.addText((t) =>
-					t
-						.setPlaceholder("15")
-						.setValue(String(s.autoSyncMinutes))
-						.onChange(async (v) => {
-							const n = Number(v);
-							if (!Number.isFinite(n) || n < 1) return;
-							this.plugin.settings.autoSyncMinutes = Math.round(n);
-							await this.plugin.saveSettings();
-							this.plugin.restartAutoSyncTimer();
-						}),
-				);
-		}
+	private renderManualSync() {
+		const row = this.manualSyncRow;
+		if (!row?.settingEl.isConnected) return;
+		const state = this.plugin.local.syncState;
+		row.setDesc(
+			state?.lastSyncedAt
+				? `Last synced ${new Date(state.lastSyncedAt).toLocaleString()} at ${state.commit.slice(0, 7)}.`
+				: "Never synced.",
+		);
 	}
 }

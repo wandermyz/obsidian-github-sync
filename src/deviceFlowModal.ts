@@ -31,7 +31,10 @@ export class DeviceFlowModal extends Modal {
 
 	onOpen() {
 		this.titleEl.setText("Sign in to GitHub");
-		this.statusEl = this.contentEl.createEl("p", { text: "Requesting a device code…" });
+		this.statusEl = this.contentEl.createEl("p", {
+			text: "Requesting a device code…",
+			cls: "github-enterprise-sync-device-status",
+		});
 		void this.start();
 	}
 
@@ -67,9 +70,7 @@ export class DeviceFlowModal extends Modal {
 		contentEl.empty();
 
 		contentEl.createEl("p", { text: "1. Copy this code:" });
-		const codeEl = contentEl.createEl("div", { text: device.user_code });
-		codeEl.style.cssText =
-			"font-size:2em;font-weight:700;letter-spacing:0.15em;text-align:center;margin:0.5em 0;user-select:text;";
+		contentEl.createDiv({ text: device.user_code, cls: "github-enterprise-sync-device-code" });
 
 		contentEl.createEl("p", {
 			text: `2. Open ${device.verification_uri} in your browser and enter the code.`,
@@ -94,13 +95,13 @@ export class DeviceFlowModal extends Modal {
 
 		this.statusEl = contentEl.createEl("p", {
 			text: "Waiting for you to finish in the browser…",
+			cls: "github-enterprise-sync-device-status",
 		});
-		this.statusEl.style.opacity = "0.7";
 	}
 
 	private fail(err: unknown) {
 		const message = err instanceof Error ? err.message : String(err);
 		this.statusEl.setText(`Sign-in failed: ${message}`);
-		this.statusEl.style.color = "var(--text-error)";
+		this.statusEl.addClass("mod-error");
 	}
 }

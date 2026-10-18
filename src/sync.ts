@@ -1,4 +1,4 @@
-import { DataAdapter, Vault, normalizePath } from "obsidian";
+import { DataAdapter, FileManager, TFile, Vault, normalizePath } from "obsidian";
 import { CompareFile, GitHubClient, TreeEntry, errorStatus } from "./github";
 import { gitBlobSha } from "./gitHash";
 
@@ -72,12 +72,13 @@ export interface SyncPlan {
 }
 
 /**
- * Files we refuse to materialize into the vault. `.obsidian` would let a repo
- * overwrite the user's plugin config — including this plugin's own data.json,
- * which holds the access token.
+ * Files we refuse to materialize into the vault. The config folder would let a
+ * repo overwrite the user's plugin config — including this plugin's own
+ * local.json, which holds the access token. `configDir` is user-configurable,
+ * so it must come from the vault rather than being assumed to be `.obsidian`.
  */
-function isRefused(path: string): boolean {
-	return path === ".obsidian" || path.startsWith(".obsidian/") || path.includes("/.obsidian/");
+function isRefused(path: string, configDir: string): boolean {
+	return path.split("/").includes(configDir);
 }
 
 /**
@@ -105,9 +106,20 @@ function conflictStamp(): string {
 	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}.${pad(d.getMinutes())}`;
 }
 
+/**
+ * Paths with a dot-segment (`.github/`, `.gitignore`) aren't in Obsidian's
+ * file index, so the Vault API can't address them; they go through the adapter.
+ */
+function isHidden(path: string): boolean {
+	return path.split("/").some((part) => part.startsWith("."));
+}
+
 export class SyncEngine {
 	/**
-	 * All file I/O goes through the adapter, not the Vault API — see writeFile().
+	 * File I/O prefers the Vault API — it serializes operations and keeps the
+	 * index, open editors, and other plugins informed — and falls back to the
+	 * adapter only where the Vault API can't do the job. See read(), write(),
+	 * and listLocalFiles().
 	 */
 	private adapter: DataAdapter;
 
@@ -115,8 +127,20 @@ export class SyncEngine {
 		private vault: Vault,
 		private client: GitHubClient,
 		private opts: SyncOptions,
+		/** Trashes files the way the user configured ("Deleted files" setting). */
+		private fileManager: FileManager,
 	) {
 		this.adapter = vault.adapter;
+	}
+
+	/** The indexed file at `path`, or null if Obsidian's index doesn't (yet) hold it. */
+	private indexed(path: string): TFile | null {
+		return isHidden(path) ? null : this.vault.getFileByPath(path);
+	}
+
+	private async read(path: string): Promise<ArrayBuffer> {
+		const file = this.indexed(path);
+		return file ? this.vault.readBinary(file) : this.adapter.readBinary(path);
 	}
 
 	/** Map a repo path to its vault path, or null if outside the synced subtree. */
@@ -124,9 +148,10 @@ export class SyncEngine {
 		const prefix = this.opts.remoteFolder ? `${this.opts.remoteFolder.replace(/\/+$/, "")}/` : "";
 		if (prefix && !repoPath.startsWith(prefix)) return null;
 		const relative = repoPath.slice(prefix.length);
-		if (!relative || isRefused(relative)) return null;
+		if (!relative) return null;
 		const folder = this.opts.targetFolder.replace(/\/+$/, "");
-		return normalizePath(folder ? `${folder}/${relative}` : relative);
+		const vaultPath = normalizePath(folder ? `${folder}/${relative}` : relative);
+		return isRefused(vaultPath, this.vault.configDir) ? null : vaultPath;
 	}
 
 	/**
@@ -165,7 +190,7 @@ export class SyncEngine {
 			comparison = await this.client.compare(owner, repo, state.commit, head);
 		} catch (err) {
 			// A force-push or GC'd commit makes the base unresolvable (404).
-			console.warn("[github-sync] compare failed, will full-sync", err);
+			console.warn("[github-enterprise-sync] compare failed, will full-sync", err);
 			return null;
 		}
 
@@ -402,7 +427,7 @@ export class SyncEngine {
 		const newBlobs: Record<string, string> = { ...state.blobs };
 
 		for (const path of changes.changed) {
-			const content = await this.adapter.readBinary(path);
+			const content = await this.read(path);
 			const sha = await this.client.createBlob(owner, repo, content);
 			entries.push({ path: this.toRepoPath(path), mode: "100644", type: "blob", sha });
 			// Hash the bytes we uploaded, not the file again — the user may be
@@ -450,9 +475,9 @@ export class SyncEngine {
 		const detail = parts.join(", ");
 		const only = report.uploaded.length + report.removed.length === 1;
 		const subject = only
-			? `Update ${(report.uploaded[0] ?? report.removed[0]) as string}`
+			? `Update ${report.uploaded[0] ?? report.removed[0]}`
 			: `Sync ${detail}`;
-		return `${subject}\n\nFrom ${this.opts.deviceLabel} via obsidian-github-sync.`;
+		return `${subject}\n\nFrom ${this.opts.deviceLabel} via GitHub Enterprise Sync.`;
 	}
 
 	/**
@@ -483,9 +508,10 @@ export class SyncEngine {
 	/**
 	 * Every syncable file under the target folder, listed from the filesystem.
 	 *
-	 * The Vault index is not used here for the same reason writes don't use it:
-	 * a file the user just created may not be indexed yet, and silently not
-	 * pushing it is worse than a slightly slower walk.
+	 * Deliberately not `Vault.getFiles()`. The index can lag the disk, and here
+	 * a lag isn't harmless: a tracked file missing from the listing is read as
+	 * "deleted locally" and its removal gets pushed. The index also omits hidden
+	 * files. A filesystem walk is slower but can't invent deletions.
 	 */
 	private async listLocalFiles(): Promise<string[]> {
 		const root = this.opts.targetFolder.replace(/\/+$/, "");
@@ -502,8 +528,7 @@ export class SyncEngine {
 				queue.push(folder);
 			}
 			for (const file of listing.files) {
-				const relative = root ? file.slice(root.length + 1) : file;
-				if (isRefused(relative)) continue;
+				if (isRefused(file, this.vault.configDir)) continue;
 				found.push(file);
 			}
 		}
@@ -514,7 +539,7 @@ export class SyncEngine {
 	/** Obsidian's own state and trash are never the user's notes. */
 	private isSkippedFolder(folder: string): boolean {
 		const name = folder.split("/").pop() ?? "";
-		return name === ".obsidian" || name === ".trash" || name === ".git";
+		return name === this.vault.configDir || name === ".trash" || name === ".git";
 	}
 
 	/** Inverse of toVaultPath: vault path -> path inside the repo. */
@@ -537,47 +562,67 @@ export class SyncEngine {
 	 */
 	private async makeConflictCopy(path: string): Promise<string | null> {
 		try {
-			const content = await this.adapter.readBinary(path);
+			const content = await this.read(path);
 			const dot = path.lastIndexOf(".");
 			const slash = path.lastIndexOf("/");
 			const hasExt = dot > slash;
 			const stem = hasExt ? path.slice(0, dot) : path;
 			const ext = hasExt ? path.slice(dot) : "";
 			const target = `${stem} (conflict ${conflictStamp()} ${this.opts.deviceLabel})${ext}`;
-			await this.adapter.writeBinary(target, content);
+			await this.writeFile(target, content);
 			return target;
 		} catch (err) {
-			console.warn("[github-sync] could not write conflict copy for", path, err);
+			console.warn("[github-enterprise-sync] could not write conflict copy for", path, err);
 			return null;
 		}
 	}
 
 	/**
-	 * Write through the adapter rather than `Vault.createBinary`.
+	 * Modify the indexed file, or create it through the Vault API; the adapter
+	 * is the fallback.
 	 *
 	 * The Vault API is index-first: it decides a path is free by consulting its
 	 * in-memory file list, which lags behind the disk right after a sync writes a
 	 * batch of files, and on mobile can lag by a lot. `createBinary` on a path the
-	 * index hasn't caught up to throws "File already exists" — the incremental
-	 * update is then lost even though the file is plainly there. The adapter talks
-	 * to the filesystem, so create and overwrite are the same call and no
-	 * existence check can go stale between the check and the write.
+	 * index hasn't caught up to throws "File already exists" even though the file
+	 * is plainly there — so a failed create falls through to the adapter, which
+	 * talks to the filesystem directly. Hidden paths always take that route.
 	 */
 	private async writeFile(path: string, content: ArrayBuffer) {
+		const file = this.indexed(path);
+		if (file) {
+			await this.vault.modifyBinary(file, content);
+			return;
+		}
+		if (!isHidden(path)) {
+			try {
+				await this.vault.createBinary(path, content);
+				return;
+			} catch {
+				// Index behind the disk; the adapter below overwrites in place.
+			}
+		}
 		await this.adapter.writeBinary(path, content);
 	}
 
 	/** Git blob SHA of what's on disk, or null if the path isn't there. */
 	private async hashOnDisk(path: string): Promise<string | null> {
 		if (!(await this.adapter.exists(path))) return null;
-		return gitBlobSha(await this.adapter.readBinary(path));
+		return gitBlobSha(await this.read(path));
 	}
 
-	/** Returns true if a file was actually removed. */
+	/**
+	 * Returns true if a file was actually removed. Indexed files go through
+	 * FileManager.trashFile, which honours the user's "Deleted files" setting.
+	 */
 	private async removeFile(path: string): Promise<boolean> {
+		const file = this.indexed(path);
+		if (file) {
+			await this.fileManager.trashFile(file);
+			return true;
+		}
 		if (!(await this.adapter.exists(path))) return false;
-		// trashLocal keeps the file recoverable in .trash, matching what the
-		// Vault API did before, but works from a path instead of a TFile.
+		// trashLocal keeps the file recoverable in .trash, like the Vault API.
 		await this.adapter.trashLocal(path);
 		return true;
 	}
@@ -594,9 +639,11 @@ export class SyncEngine {
 			folder = folder ? `${folder}/${part}` : part;
 			if (await this.adapter.exists(folder)) continue;
 			try {
-				await this.adapter.mkdir(folder);
+				if (isHidden(folder)) await this.adapter.mkdir(folder);
+				else await this.vault.createFolder(folder);
 			} catch {
-				// Concurrent creation or already-exists; harmless.
+				// The index may already hold it, or lag the disk; settle it on disk.
+				if (!(await this.adapter.exists(folder))) await this.adapter.mkdir(folder);
 			}
 		}
 	}

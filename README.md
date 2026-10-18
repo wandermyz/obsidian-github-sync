@@ -1,4 +1,4 @@
-# obsidian-github-sync
+# GitHub Enterprise Sync
 
 An Obsidian plugin that syncs notes with a GitHub repository — including GitHub
 Enterprise Server — over the **GitHub REST API**. There is no Git
@@ -8,6 +8,12 @@ including Obsidian on iOS.
 Status: **early**. Sync is bi-directional: it pulls changes from GitHub and
 pushes local edits back as ordinary commits, with incremental updates,
 integrity verification, conflict copies, and automatic syncing.
+
+![Notes synced from GitHub, with the sync notice](docs/screenshots/desktop-sync.png)
+
+| Phone | Settings | Sign-in |
+| --- | --- | --- |
+| ![Synced note on a phone](docs/screenshots/mobile-note.png) | ![Settings on a phone](docs/screenshots/mobile-settings.png) | ![Device-code sign-in on a phone](docs/screenshots/mobile-sign-in.png) |
 
 ## Why this exists
 
@@ -122,22 +128,45 @@ doesn't actually match, and the missing files would never be noticed again.
   version lands at the canonical path and yours is preserved as a conflict copy
   (see above). If the copy can't be written, the remote update is skipped
   instead.
-- Anything under `.obsidian/` is refused in both directions, so a repository
+- Anything under the vault's config folder (`.obsidian/` by default, or
+  wherever you've moved it) is refused in both directions, so a repository
   can't overwrite your plugin configuration — and your configuration, including
   the `local.json` holding your access token, is never pushed. `.trash/` and
   `.git/` are skipped when pushing for the same reason.
+
+## Network use and privacy
+
+This plugin talks to exactly one remote service: **the GitHub instance you
+configure** — github.com or your own GitHub Enterprise Server. It needs that
+connection to sign you in and to read and write the repository you sync with.
+
+- **Account required.** You need a GitHub (or GitHub Enterprise) account with
+  access to the repository, plus a GitHub OAuth app with device flow enabled
+  (see [Setup](#setup)).
+- **What is sent.** OAuth requests to `<host>/login/device/code` and
+  `<host>/login/oauth/access_token`, and GitHub REST API requests to
+  `api.github.com` (or `<host>/api/v3`) that read and write the configured
+  repository: the files in the synced folder and commit metadata.
+- **No telemetry, no third parties.** Nothing is sent anywhere other than the
+  GitHub host you configure. There are no analytics, ads, or tracking.
+- **Credentials stay on the device.** Tokens are stored in the plugin's
+  `local.json` and never synced or committed (see
+  [Where state is stored](#where-state-is-stored)).
+
+Signing in opens GitHub's device-authorization page in your system browser. The
+plugin never sees your password.
 
 ## Setup
 
 Register a GitHub OAuth app with **"Enable Device Flow"** checked (Settings →
 Developer settings → OAuth Apps). No callback URL is needed for this flow.
 
-Then in Obsidian: **Settings → GitHub Sync**
+Then in Obsidian: **Settings → GitHub Enterprise Sync**
 
 | Setting | Value |
 | --- | --- |
 | GitHub host | `https://github.com`, or `https://github.example.com` for Enterprise Server |
-| OAuth app Client ID | from your OAuth app |
+| OAuth app client ID | from your OAuth app |
 | Scopes | `repo read:org` (default) |
 | Repository | `owner/repo` to sync from |
 | Branch | empty for the repository's default branch |
@@ -219,8 +248,54 @@ and nothing stops a bug from reaching further.
 Covered: first full sync, incremental edit/add/delete, a no-op sync, pushing new
 and edited and deleted files, a second device pulling what the first pushed,
 concurrent-push race detection, a both-sides edit producing a conflict copy that
-then pushes, the mass-deletion guard refusing, and `.obsidian` never being
+then pushes, the mass-deletion guard refusing, and the config folder never being
 materialized from the repo.
+
+## Tests in the Obsidian app
+
+`tests/app/` runs the built plugin inside the real Obsidian desktop app. It
+creates a scratch vault, installs `main.js`, `manifest.json`, and `styles.css`
+there, launches Obsidian with a remote-debugging port, and drives it over the
+DevTools protocol. The tests use commands, the vault API, notices, the settings
+tab, and the sign-in modal, against the same repository and cached token as
+`tests/e2e/`.
+
+```bash
+npm run test:app              # desktop, then an emulated phone
+npm run test:app -- mobile    # one mode only
+npm run screenshots           # regenerate docs/screenshots/
+```
+
+"Mobile" is Obsidian's own `app.emulateMobile` at phone size. It covers
+`Platform.isMobile` and the phone layout, but not iOS networking or the iOS file
+system — that still needs a real device.
+
+**This quits and relaunches Obsidian.** Only the scratch vault is open while it
+runs; `obsidian.json` is restored and Obsidian reopened normally afterwards.
+macOS only.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and on pull requests:
+
+| Job | Runner | What |
+| --- | --- | --- |
+| Build, lint, unit tests | Ubuntu | `npm run build`, `npm run lint` (Obsidian's own ESLint rules, as used by the community directory review), `npm test` |
+| Sync engine against GitHub | Ubuntu | `npm run test:e2e` |
+| Plugin inside Obsidian | macOS | installs the latest Obsidian release, then `npm run test:app`; screenshots are uploaded as an artifact |
+
+The last two need credentials for the test repository, configured in the
+repository's **Settings → Secrets and variables → Actions**:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `E2E_TOKEN` | secret | A [fine-grained token](https://github.com/settings/personal-access-tokens/new) limited to the test repository, with **Contents: read and write** |
+| `E2E_REPO` | variable | `owner/repo` of the test repository |
+| `E2E_CLIENT_ID` | variable | The OAuth app's client ID (only used to request a device code) |
+
+Without `E2E_TOKEN` — including on pull requests from forks — those jobs skip
+instead of failing. Locally, the same variables override `.env.e2e`, and
+`E2E_TOKEN` replaces the cached device-flow token.
 
 ## Build and install
 
@@ -231,8 +306,8 @@ npm run dev       # watch mode
 npm run deploy    # build, then copy into plugins-dev-vault/
 ```
 
-For a manual install, copy `main.js` and `manifest.json` into
-`<vault>/.obsidian/plugins/obsidian-github-sync/` and enable the plugin under
+For a manual install, copy `main.js`, `manifest.json`, and `styles.css` into
+`<vault>/.obsidian/plugins/github-enterprise-sync/` and enable the plugin under
 Settings → Community plugins.
 
 On mobile, [BRAT](https://github.com/TfTHacker/obsidian42-brat) is the easiest
@@ -245,7 +320,7 @@ vault ("Open folder as vault"), turn off Restricted Mode, and enable the plugin.
 After a redeploy, toggle the plugin off and on to load the new build.
 
 It is gitignored deliberately: once you sign in, the access token is written to
-`.obsidian/plugins/obsidian-github-sync/local.json` inside that vault. To deploy
+`.obsidian/plugins/github-enterprise-sync/local.json` inside that vault. To deploy
 elsewhere:
 
 ```bash
@@ -255,7 +330,7 @@ node scripts/deploy-dev.mjs /path/to/other/vault
 ## Where state is stored
 
 The plugin writes two files into
-`<vault>/.obsidian/plugins/obsidian-github-sync/`:
+`<vault>/.obsidian/plugins/github-enterprise-sync/`:
 
 | File | Contents | Safe to sync/commit? |
 | --- | --- | --- |
@@ -266,7 +341,7 @@ The split exists so you can keep your configuration in version control while
 excluding the credential. Add to the vault's `.gitignore`:
 
 ```
-.obsidian/plugins/obsidian-github-sync/local.json
+.obsidian/plugins/github-enterprise-sync/local.json
 ```
 
 `local.json` also holds the last synced commit and the blob SHA of every file

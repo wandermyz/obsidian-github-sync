@@ -16,28 +16,38 @@ const TOKEN_FILE = path.join(repoRoot, ".e2e-token.json");
 /** Renew this long before expiry, so a run can't die mid-push. */
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
+/**
+ * Settings come from `.env.e2e`, with real environment variables taking
+ * precedence — so CI can configure the run without writing the file.
+ */
 export async function loadConfig() {
-	let raw;
+	const env = {};
+	let raw = null;
 	try {
 		raw = await fs.readFile(ENV_FILE, "utf8");
 	} catch {
-		throw new Error(
-			`Missing ${path.basename(ENV_FILE)}. Copy .env.e2e.example to .env.e2e and fill it in.`,
-		);
+		// Fine as long as the environment supplies what's required.
 	}
-
-	const env = {};
-	for (const line of raw.split(/\r?\n/)) {
+	for (const line of (raw ?? "").split(/\r?\n/)) {
 		const trimmed = line.trim();
 		if (!trimmed || trimmed.startsWith("#")) continue;
 		const eq = trimmed.indexOf("=");
 		if (eq === -1) continue;
 		env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
 	}
+	for (const [key, value] of Object.entries(process.env)) {
+		if (key.startsWith("E2E_") && value) env[key] = value;
+	}
 
 	const required = ["E2E_REPO", "E2E_CLIENT_ID"];
 	const missing = required.filter((k) => !env[k]);
-	if (missing.length) throw new Error(`${path.basename(ENV_FILE)} is missing: ${missing.join(", ")}`);
+	if (missing.length) {
+		throw new Error(
+			raw === null
+				? `Missing ${path.basename(ENV_FILE)}. Copy .env.e2e.example to .env.e2e and fill it in, or set ${missing.join(", ")}.`
+				: `${path.basename(ENV_FILE)} is missing: ${missing.join(", ")}`,
+		);
+	}
 
 	const [owner, repo] = env.E2E_REPO.split("/");
 	if (!owner || !repo) throw new Error(`E2E_REPO must be "owner/repo", got "${env.E2E_REPO}"`);
@@ -93,6 +103,10 @@ function toCached(response, clientId, webBase) {
  * can't work there.
  */
 export async function getAccessToken(config, engine, { interactive = true } = {}) {
+	// CI: a token handed in directly (e.g. a fine-grained PAT limited to the
+	// test repo). No cache, no refresh, no device flow.
+	if (process.env.E2E_TOKEN) return process.env.E2E_TOKEN;
+
 	const host = engine.hostFromWebBase(config.webBase);
 	const cached = await readCachedToken();
 	const matches = cached && cached.clientId === config.clientId && cached.webBase === config.webBase;

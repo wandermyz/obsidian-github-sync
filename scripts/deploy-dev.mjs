@@ -21,7 +21,7 @@ const pluginId = JSON.parse(
 const target = path.join(vault, ".obsidian", "plugins", pluginId);
 await mkdir(target, { recursive: true });
 
-for (const file of ["main.js", "manifest.json"]) {
+for (const file of ["main.js", "manifest.json", "styles.css"]) {
 	const src = path.join(repoRoot, file);
 	try {
 		await access(src);

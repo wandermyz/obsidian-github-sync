@@ -114,7 +114,23 @@ export class FsAdapter {
 	}
 }
 
-/** The engine only ever reaches through to `vault.adapter`. */
+/**
+ * A vault whose index knows no files: reads, overwrites and deletes take the
+ * engine's adapter path, and creates go through createBinary with its
+ * stale-index fallback. The full Vault-API path is covered by tests/app/.
+ */
 export function fakeVault(root) {
-	return { adapter: new FsAdapter(root) };
+	const adapter = new FsAdapter(root);
+	return {
+		adapter,
+		configDir: ".obsidian",
+		getFileByPath: () => null,
+		// Like Obsidian's when its index lags the disk: creating a path that
+		// already exists on disk fails, and the engine must fall back.
+		async createBinary(path, data) {
+			if (await adapter.exists(path)) throw new Error("File already exists.");
+			await adapter.writeBinary(path, data);
+		},
+		createFolder: (path) => adapter.mkdir(path),
+	};
 }
