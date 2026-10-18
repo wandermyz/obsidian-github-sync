@@ -136,6 +136,26 @@ test("readBlob rejects a malformed sha before issuing a request", async (engine)
 	);
 });
 
+test("the built-in app is used on github.com when no client ID is set", async (engine) => {
+	const dotcom = engine.hostFromWebBase("https://github.com");
+	assert.equal(engine.resolveClientId("", dotcom), engine.DEFAULT_APP.clientId);
+	assert.equal(engine.resolveClientId("  ", dotcom), engine.DEFAULT_APP.clientId);
+	assert.equal(engine.resolveClientId("Ov23custom", dotcom), "Ov23custom", "a configured ID wins");
+});
+
+test("GitHub Enterprise Server has no built-in app", async (engine) => {
+	const ghes = engine.hostFromWebBase("https://github.example.com");
+	assert.equal(engine.resolveClientId("", ghes), "", "an app on github.com doesn't exist on GHES");
+	assert.equal(engine.resolveClientId("Iv23onprem", ghes), "Iv23onprem");
+});
+
+test("GitHub Apps and OAuth apps are told apart by client ID", async (engine) => {
+	assert.equal(engine.isGitHubApp(engine.DEFAULT_APP.clientId), true);
+	assert.equal(engine.isGitHubApp("Iv1.0123456789abcdef"), true);
+	assert.equal(engine.isGitHubApp("Ov23lij3rM1mv0XDnuiA"), false);
+	assert.equal(engine.isGitHubApp("0123456789abcdef0123"), false, "legacy OAuth app IDs are hex");
+});
+
 const engine = await loadEngine();
 let failed = 0;
 

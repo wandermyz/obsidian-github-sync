@@ -129,7 +129,8 @@ async function main() {
 			await createVault(vaultRoot, {
 				repoRoot,
 				settings: {
-					clientId: config.clientId,
+					// Empty: sign-in goes through the plugin's built-in app.
+					clientId: "",
 					githubWebBase: config.webBase,
 					scope: config.scope,
 					syncRepo: `${ctx.owner}/${ctx.repo}`,
@@ -146,6 +147,7 @@ async function main() {
 					accessTokenExpiresAt: cached.accessTokenExpiresAt ?? 0,
 					refreshToken: "",
 					refreshTokenExpiresAt: 0,
+					clientId: config.clientId,
 					syncState: null,
 					deviceLabel: "",
 				},
@@ -296,6 +298,29 @@ async function runSuite({ page, client, accessToken, ctx, folder, vaultRoot, mod
 		assert(local.accessToken !== "stolen", "the plugin's local.json was overwritten from the repo");
 	});
 
+	await test("a repo the app can't reach explains how to grant access", async () => {
+		// To a GitHub App token, a repo it isn't installed on 404s just like one
+		// that doesn't exist, so a made-up name exercises the same path.
+		// The hint keys off the app that issued the token. CI's token may come
+		// from elsewhere, so pose as a built-in-app sign-in for this test.
+		const real = await page.eval(`JSON.stringify([${P}.settings.syncRepo, ${P}.local.clientId])`);
+		await page.eval(`${P}.local.clientId = "Iv23licEZx8RvafEllsg"`);
+		await page.eval(`${P}.settings.syncRepo = ${JSON.stringify(`${ctx.owner}/not-installed-${RUN_ID}`)}`);
+		try {
+			await clearNotices();
+			await page.eval(`${P}.sync("manual").then(() => true)`);
+			const notice = await page.eval(`(() => {
+				const n = [...document.querySelectorAll(".notice")].find((el) => el.innerText.includes("can't see"));
+				return n ? { text: n.innerText, href: n.querySelector("a")?.getAttribute("href") ?? null } : null;
+			})()`);
+			assert(notice, `no "can't see" notice: ${(await notices()).join(" | ")}`);
+			assert(notice.text.includes("installed on"), `notice text: ${notice.text}`);
+			assertEqual(notice.href, "https://github.com/apps/obsidian-github-enterprise-sync/installations/new", "install link");
+		} finally {
+			await page.eval(`(([repo, clientId]) => { ${P}.settings.syncRepo = repo; ${P}.local.clientId = clientId; })(${real})`);
+		}
+	});
+
 	await test("settings tab renders", async () => {
 		await page.eval(`app.setting.open(), app.setting.openTabById("${PLUGIN_ID}"), true`);
 		const text = await waitFor(
@@ -303,10 +328,28 @@ async function runSuite({ page, client, accessToken, ctx, folder, vaultRoot, mod
 			5000,
 			"settings tab",
 		);
-		for (const label of ["GitHub host", "OAuth app client ID", "Repository", "Automatic sync", `Signed in as ${await page.eval(`${P}.local.login`)}`]) {
+		for (const label of ["GitHub host", "App client ID", "Repository", "Automatic sync", `Signed in as ${await page.eval(`${P}.local.login`)}`]) {
 			assert(text.includes(label), `settings tab is missing "${label}"`);
 		}
 		await shot("settings");
+
+		// With no client ID the built-in GitHub App signs in: no scopes to set,
+		// but a way to choose which repositories it may reach.
+		const shown = (name) =>
+			page.eval(`(() => {
+				const row = [...app.setting.activeTab.containerEl.querySelectorAll(".setting-item")]
+					.find((el) => el.querySelector(".setting-item-name")?.innerText === ${JSON.stringify(name)});
+				return !!row && row.offsetParent !== null;
+			})()`);
+		assertEqual(await page.eval(`${P}.clientId`), "Iv23licEZx8RvafEllsg", "built-in client ID");
+		assertEqual(await shown("Repository access"), true, "Repository access with the built-in app");
+		assertEqual(await shown("Scopes"), false, "Scopes with a GitHub App");
+
+		// A custom OAuth app brings scopes back and hides the install link.
+		await page.eval(`app.setting.activeTab.setControlValue("clientId", "Ov23custom")`);
+		await waitFor(async () => (await shown("Scopes")) && !(await shown("Repository access")), 5000, "OAuth app rows");
+		await page.eval(`app.setting.activeTab.setControlValue("clientId", "")`);
+		await waitFor(() => shown("Repository access"), 5000, "built-in app rows again");
 		await page.eval("app.setting.close(), true");
 	});
 

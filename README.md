@@ -37,14 +37,16 @@ finish. Any SSO session already present in that browser is reused.
 
 There is no embedded web view anywhere in this codebase.
 
-If the OAuth app has expiring user tokens enabled, the device flow returns an
+If the app issues expiring user tokens (GitHub Apps do by default), the device flow returns an
 access token valid ~8 hours plus a refresh token valid ~6 months. Every API
 call goes through `validAccessToken()`, which exchanges the refresh token when
 the access token is within five minutes of expiry. GitHub **rotates the refresh
 token on each use**, so both halves of the response are persisted together —
 dropping the new refresh token would strand the plugin at the next renewal.
 Once the refresh token itself lapses, you sign in again. With non-expiring
-tokens, `expires_in` is absent and the refresh path is simply never taken.
+tokens, `expires_in` is absent and the refresh path is simply never taken. The
+refresh always goes to the app that issued the token, so changing **App client
+ID** later doesn't break renewal of an existing sign-in.
 
 ### Incremental sync
 
@@ -141,8 +143,10 @@ configure** — github.com or your own GitHub Enterprise Server. It needs that
 connection to sign you in and to read and write the repository you sync with.
 
 - **Account required.** You need a GitHub (or GitHub Enterprise) account with
-  access to the repository, plus a GitHub OAuth app with device flow enabled
-  (see [Setup](#setup)).
+  access to the repository. On github.com, sign-in goes through the plugin's
+  GitHub App, [Obsidian GitHub Enterprise Sync](https://github.com/apps/obsidian-github-enterprise-sync),
+  which can only reach the repositories you install it on. On Enterprise Server
+  you use an app registered there (see [Setup](#setup)).
 - **What is sent.** OAuth requests to `<host>/login/device/code` and
   `<host>/login/oauth/access_token`, and GitHub REST API requests to
   `api.github.com` (or `<host>/api/v3`) that read and write the configured
@@ -158,25 +162,48 @@ plugin never sees your password.
 
 ## Setup
 
-Register a GitHub OAuth app with **"Enable Device Flow"** checked (Settings →
-Developer settings → OAuth Apps). No callback URL is needed for this flow.
+### github.com
 
-Then in Obsidian: **Settings → GitHub Enterprise Sync**
+1. In Obsidian, open **Settings → GitHub Enterprise Sync** and set
+   **Repository** to the `owner/repo` holding your notes. Leave **App client
+   ID** empty.
+2. Under **Repository access**, press **Choose repositories** and
+   [install the app](https://github.com/apps/obsidian-github-enterprise-sync/installations/new)
+   on that repository. It asks only for read and write access to file
+   contents.
+3. Press **Sign in**, copy the code, tap **Open browser**, and authorize.
+
+For repositories owned by an organization, an owner of that organization
+installs the app (or approves your request to).
+
+### GitHub Enterprise Server
+
+An app registered on github.com doesn't exist on your server, so register one
+there — once for everyone at your company is enough:
+
+1. On your server, go to **Settings → Developer settings → GitHub Apps → New
+   GitHub App** (or the same under an organization's settings).
+2. Check **Enable Device Flow**, uncheck **Webhook → Active**, and under
+   **Repository permissions** set **Contents** to **Read and write**. No
+   callback URL, client secret, or private key is needed.
+3. Install it on the repositories to sync, and copy its **Client ID**.
+
+Then set **GitHub host** to your server (`https://github.example.com`), paste
+the client ID into **App client ID**, and sign in. An OAuth app with device
+flow enabled works too; for one of those, **Scopes** (default `repo read:org`)
+controls its access.
+
+### All settings
 
 | Setting | Value |
 | --- | --- |
-| GitHub host | `https://github.com`, or `https://github.example.com` for Enterprise Server |
-| OAuth app client ID | from your OAuth app |
-| Scopes | `repo read:org` (default) |
+| GitHub host | `https://github.com`, or your Enterprise Server URL |
+| App client ID | empty for the built-in app on github.com; your app's client ID on Enterprise Server |
+| Scopes | OAuth apps only |
 | Repository | `owner/repo` to sync from |
 | Branch | empty for the repository's default branch |
 | Remote folder | sync only this subfolder of the repo; empty for the whole repo |
 | Vault folder | where files land in the vault; empty for the vault root |
-
-Press **Sign in**, copy the code, tap **Open browser**, authorize.
-
-For repositories behind SAML SSO on github.com, you may additionally need to
-authorize the OAuth app for the organization from its settings page.
 
 ### Automatic sync
 
@@ -205,8 +232,9 @@ mismatches, conflicts, and refused pushes always raise a notice.
 node scripts/device-flow-test.mjs <client_id> owner/repo [https://github.example.com]
 ```
 
-Runs the identical request sequence from a terminal — useful to confirm the
-OAuth app is configured correctly before installing the plugin.
+Runs the identical request sequence from a terminal — useful to confirm an app
+registered on Enterprise Server is configured correctly before installing the
+plugin.
 
 ## Tests
 
@@ -291,7 +319,7 @@ repository's **Settings → Secrets and variables → Actions**:
 | --- | --- | --- |
 | `E2E_TOKEN` | secret | A [fine-grained token](https://github.com/settings/personal-access-tokens/new) limited to the test repository, with **Contents: read and write** |
 | `E2E_REPO` | variable | `owner/repo` of the test repository |
-| `E2E_CLIENT_ID` | variable | The OAuth app's client ID (only used to request a device code) |
+| `E2E_CLIENT_ID` | variable | The client ID of the app that issued `E2E_TOKEN` (the plugin's GitHub App, `Iv23licEZx8RvafEllsg`, or your own) |
 
 Without `E2E_TOKEN` — including on pull requests from forks — those jobs skip
 instead of failing. Locally, the same variables override `.env.e2e`, and

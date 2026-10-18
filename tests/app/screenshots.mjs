@@ -88,7 +88,7 @@ async function main() {
 			await createVault(VAULT, {
 				repoRoot,
 				settings: {
-					clientId: config.clientId,
+					clientId: "", // the built-in app, as a new user would have it
 					githubWebBase: config.webBase,
 					scope: config.scope,
 					syncRepo: `${ctx.owner}/${ctx.repo}`,
@@ -110,6 +110,7 @@ async function main() {
 					// what a normally signed-in user sees.
 					refreshToken: "placeholder",
 					refreshTokenExpiresAt: Date.now() + 180 * 24 * 3600 * 1000,
+					clientId: config.clientId,
 					syncState: null,
 					deviceLabel: "",
 				},
