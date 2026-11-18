@@ -80,8 +80,21 @@ export async function launch(vaultPath) {
 		page.close();
 		return null;
 	}, process.env.CI ? 120000 : 30000, "Obsidian to open the test vault");
-	// Let the workspace finish laying out before anything pokes at it.
-	await page.eval("new Promise((r) => app.workspace.onLayoutReady(r))");
+	// Let the workspace finish laying out before anything pokes at it. Obsidian
+	// 1.15 publishes `app` and its vault before it constructs the workspace, so
+	// poll for the workspace rather than assume it arrived with the vault.
+	await waitFor(
+		() => page.eval("window.app?.workspace?.layoutReady === true"),
+		process.env.CI ? 120000 : 30000,
+		"the workspace layout to be ready",
+	).catch(async (err) => {
+		// If the workspace never shows up, say what the app does have, so the
+		// next Obsidian change is diagnosable from the CI log alone.
+		const shape = await page
+			.eval("JSON.stringify({ workspace: typeof app.workspace, keys: Object.keys(app).sort() })", 5000)
+			.catch(() => "unavailable");
+		throw new Error(`${err.message}; app shape: ${shape}`);
+	});
 	// Obsidian 1.14 opens settings in a pop-out window on desktop. Keep it in
 	// the main one, where this connection and screenshots can see it.
 	await page.eval("app.setting.shouldUsePopout = () => false, true");
