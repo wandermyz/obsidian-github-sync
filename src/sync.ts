@@ -91,6 +91,13 @@ const MAX_DELETION_FRACTION = 0.1;
 const MIN_DELETIONS_BEFORE_GUARD = 5;
 
 /**
+ * How often a long pull saves its per-file progress. Rewriting local.json after
+ * every file is too slow on a big vault; this bounds both the cost and how much
+ * work a killed app can lose.
+ */
+const CHECKPOINT_INTERVAL_MS = 3000;
+
+/**
  * A git object SHA is exactly 40 lowercase hex characters. GitHub rejects
  * anything else with a 422, so checking here turns a confusing API error into a
  * decision we can act on.
@@ -275,6 +282,7 @@ export class SyncEngine {
 		plan: SyncPlan,
 		state: SyncState | null,
 		onProgress?: (done: number, total: number) => void,
+		onCheckpoint?: (partial: SyncState) => Promise<void>,
 	): Promise<{ report: SyncReport; state: SyncState }> {
 		const blobs: Record<string, string> = { ...(state?.blobs ?? {}) };
 		const report: SyncReport = {
@@ -294,64 +302,93 @@ export class SyncEngine {
 		const total = plan.writes.length + plan.deletes.length;
 		let done = 0;
 
-		for (const write of plan.writes) {
-			const exists = await this.adapter.exists(write.path);
+		// Per-file progress, saved without advancing the commit pointer. If the
+		// run dies partway (a large blob fails to download, the OS kills a
+		// backgrounded mobile app), files already written must not look like
+		// local edits next time — otherwise each one becomes a bogus conflict.
+		const partialState = (): SyncState => ({
+			commit: state?.commit ?? "",
+			blobs: { ...blobs },
+			lastSyncedAt: state?.lastSyncedAt ?? 0,
+		});
+		let lastCheckpoint = Date.now();
+		const maybeCheckpoint = async () => {
+			if (!onCheckpoint || Date.now() - lastCheckpoint < CHECKPOINT_INTERVAL_MS) return;
+			lastCheckpoint = Date.now();
+			await onCheckpoint(partialState());
+		};
 
-			// Nothing to do when the local file is already this exact blob.
-			if (exists && blobs[write.path] === write.blobSha) {
-				if ((await this.hashOnDisk(write.path)) === write.blobSha) {
+		try {
+			for (const write of plan.writes) {
+				const exists = await this.adapter.exists(write.path);
+				const onDisk = exists ? await this.hashOnDisk(write.path) : null;
+
+				// The disk already holds the remote version — whether from an earlier
+				// sync, an interrupted one, or an identical edit made on both sides.
+				// Nothing to download and nothing to preserve.
+				if (onDisk === write.blobSha) {
+					blobs[write.path] = write.blobSha;
 					report.unchanged++;
 					onProgress?.(++done, total);
 					continue;
 				}
-			}
 
-			// Local and remote both moved. Rather than drop either side, the remote
-			// version takes the canonical path and the local bytes are preserved
-			// beside it as a conflict copy — the next push sends that copy up, so
-			// both versions exist everywhere and the user resolves it by editing.
-			if (exists && blobs[write.path]) {
-				const onDisk = await this.hashOnDisk(write.path);
-				if (onDisk !== blobs[write.path]) {
-					const copy = await this.makeConflictCopy(write.path);
-					if (copy) {
-						report.conflicts.push(copy);
-					} else {
-						// Couldn't preserve the local bytes, so don't overwrite them.
-						report.skippedLocalEdits.push(write.path);
-						onProgress?.(++done, total);
-						continue;
+				// Local and remote both moved. Rather than drop either side, the remote
+				// version takes the canonical path and the local bytes are preserved
+				// beside it as a conflict copy — the next push sends that copy up, so
+				// both versions exist everywhere and the user resolves it by editing.
+				if (exists && blobs[write.path]) {
+					if (onDisk !== blobs[write.path]) {
+						const copy = await this.makeConflictCopy(write.path);
+						if (copy) {
+							report.conflicts.push(copy);
+						} else {
+							// Couldn't preserve the local bytes, so don't overwrite them.
+							report.skippedLocalEdits.push(write.path);
+							onProgress?.(++done, total);
+							continue;
+						}
 					}
 				}
+
+				const content = await this.client.readBlob(this.opts.owner, this.opts.repo, write.blobSha);
+
+				await this.ensureParentFolder(write.path);
+				await this.writeFile(write.path, content);
+				if (exists) report.updated++;
+				else report.added++;
+
+				// Integrity check: re-read what we just wrote and hash it.
+				const actual = await this.hashOnDisk(write.path);
+				if (actual === write.blobSha) {
+					blobs[write.path] = write.blobSha;
+					report.verifiedFiles++;
+				} else {
+					report.integrityFailures.push(
+						actual === null ? `${write.path} (missing after write)` : `${write.path} (sha mismatch)`,
+					);
+					// Don't record a SHA we couldn't confirm — next sync retries it.
+					delete blobs[write.path];
+				}
+
+				onProgress?.(++done, total);
+				await maybeCheckpoint();
 			}
 
-			const content = await this.client.readBlob(this.opts.owner, this.opts.repo, write.blobSha);
-
-			await this.ensureParentFolder(write.path);
-			await this.writeFile(write.path, content);
-			if (exists) report.updated++;
-			else report.added++;
-
-			// Integrity check: re-read what we just wrote and hash it.
-			const actual = await this.hashOnDisk(write.path);
-			if (actual === write.blobSha) {
-				blobs[write.path] = write.blobSha;
-				report.verifiedFiles++;
-			} else {
-				report.integrityFailures.push(
-					actual === null ? `${write.path} (missing after write)` : `${write.path} (sha mismatch)`,
-				);
-				// Don't record a SHA we couldn't confirm — next sync retries it.
-				delete blobs[write.path];
+			for (const path of plan.deletes) {
+				if (await this.removeFile(path)) report.deleted++;
+				delete blobs[path];
+				onProgress?.(++done, total);
 			}
-
-			onProgress?.(++done, total);
-		}
-
-		for (const path of plan.deletes) {
-			if (await this.removeFile(path)) report.deleted++;
-			delete blobs[path];
-			onProgress?.(++done, total);
+		} catch (err) {
+			// Record what did land before surfacing the failure. A checkpoint that
+			// itself fails mustn't mask the original error.
+			try {
+				await onCheckpoint?.(partialState());
+			} catch (saveErr) {
+				console.warn("[github-enterprise-sync] could not checkpoint after a failed pull", saveErr);
+			}
+			throw err;
 		}
 
 		// A full sync is authoritative: anything we tracked but the tree no

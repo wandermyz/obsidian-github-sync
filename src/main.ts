@@ -425,9 +425,17 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 			return true;
 		}
 
-		const { report, state: newState } = await engine.apply(plan, state, (done, total) => {
-			this.renderStatusBar(`Pulling ${done}/${total}…`);
-		});
+		const { report, state: newState } = await engine.apply(
+			plan,
+			state,
+			(done, total) => {
+				this.renderStatusBar(`Pulling ${done}/${total}…`);
+			},
+			async (partial) => {
+				this.local.syncState = partial;
+				await this.saveLocal();
+			},
+		);
 
 		this.local.syncState = newState;
 		await this.saveLocal();

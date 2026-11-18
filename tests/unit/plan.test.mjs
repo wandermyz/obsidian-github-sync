@@ -192,6 +192,108 @@ test("lag retries give up eventually", async (engine) => {
 	assert.equal(calls, 3);
 });
 
+/** An in-memory DataAdapter: just enough of the filesystem for apply(). */
+function memoryAdapter(files) {
+	const store = new Map(Object.entries(files).map(([p, text]) => [p, bytes(text)]));
+	return {
+		store,
+		exists: async (p) => store.has(p) || [...store.keys()].some((k) => k.startsWith(`${p}/`)),
+		readBinary: async (p) => store.get(p),
+		writeBinary: async (p, data) => void store.set(p, data),
+		mkdir: async () => {},
+		trashLocal: async (p) => void store.delete(p),
+	};
+}
+
+/**
+ * A vault with an empty index, so every read and write falls through to the
+ * adapter — the same path the engine takes for files Obsidian hasn't indexed.
+ */
+function memoryVault(adapter) {
+	return {
+		adapter,
+		configDir: ".obsidian",
+		getFileByPath: () => null,
+		createBinary: async (p, data) => adapter.writeBinary(p, data),
+		createFolder: async () => {},
+	};
+}
+
+function bytes(text) {
+	const b = new TextEncoder().encode(text);
+	return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+}
+
+/** A client serving blobs by SHA; `failOn` makes one download throw, like a big file on mobile. */
+function blobClient(blobs, failOn) {
+	return {
+		readBlob: async (_o, _r, sha) => {
+			if (sha === failOn) throw new Error("network error");
+			return bytes(blobs[sha]);
+		},
+	};
+}
+
+test("a file already at the remote version is not a conflict", async (engine) => {
+	// The vault was updated by an earlier pull that crashed before saving state,
+	// so the recorded SHA is stale but the disk already matches the remote.
+	const oldSha = await engine.gitBlobShaOfText("v1");
+	const newSha = await engine.gitBlobShaOfText("v2");
+	const adapter = memoryAdapter({ "a.md": "v2" });
+	const sync = new engine.SyncEngine(memoryVault(adapter), blobClient({}), OPTS, {});
+
+	const { report, state } = await sync.apply(
+		{ mode: "incremental", reason: "", targetCommit: HEAD, writes: [{ path: "a.md", blobSha: newSha }], deletes: [], unchanged: 0 },
+		{ commit: SHA_B, blobs: { "a.md": oldSha }, lastSyncedAt: 0 },
+	);
+
+	assert.deepEqual(report.conflicts, []);
+	assert.deepEqual([...adapter.store.keys()], ["a.md"], "no conflict copy should be written");
+	assert.equal(state.blobs["a.md"], newSha);
+	assert.equal(state.commit, HEAD);
+});
+
+test("a genuine local edit still gets a conflict copy", async (engine) => {
+	const oldSha = await engine.gitBlobShaOfText("v1");
+	const newSha = await engine.gitBlobShaOfText("v2");
+	const adapter = memoryAdapter({ "a.md": "mine" });
+	const sync = new engine.SyncEngine(memoryVault(adapter), blobClient({ [newSha]: "v2" }), OPTS, {});
+
+	const { report } = await sync.apply(
+		{ mode: "incremental", reason: "", targetCommit: HEAD, writes: [{ path: "a.md", blobSha: newSha }], deletes: [], unchanged: 0 },
+		{ commit: SHA_B, blobs: { "a.md": oldSha }, lastSyncedAt: 0 },
+	);
+
+	assert.equal(report.conflicts.length, 1);
+	assert.equal(new TextDecoder().decode(adapter.store.get(report.conflicts[0])), "mine");
+	assert.equal(new TextDecoder().decode(adapter.store.get("a.md")), "v2");
+});
+
+test("a pull that fails partway checkpoints the files it already wrote", async (engine) => {
+	const [a1, a2, b1, b2] = await Promise.all(["a1", "a2", "b1", "b2"].map(engine.gitBlobShaOfText));
+	const adapter = memoryAdapter({ "a.md": "a1", "big.db": "b1" });
+	const sync = new engine.SyncEngine(memoryVault(adapter), blobClient({ [a2]: "a2" }, b2), OPTS, {});
+	const base = { commit: SHA_B, blobs: { "a.md": a1, "big.db": b1 }, lastSyncedAt: 0 };
+	const plan = {
+		mode: "incremental", reason: "", targetCommit: HEAD, deletes: [], unchanged: 0,
+		writes: [{ path: "a.md", blobSha: a2 }, { path: "big.db", blobSha: b2 }],
+	};
+
+	let saved = null;
+	await assert.rejects(() => sync.apply(plan, base, undefined, async (s) => void (saved = s)), /network error/);
+
+	assert.ok(saved, "progress should be checkpointed before the error propagates");
+	assert.equal(saved.commit, SHA_B, "the commit pointer must not advance on a partial pull");
+	assert.equal(saved.blobs["a.md"], a2, "the file that landed is recorded at its new version");
+	assert.equal(saved.blobs["big.db"], b1);
+
+	// The retry — the run that used to turn a.md into a conflict copy.
+	const retry = new engine.SyncEngine(memoryVault(adapter), blobClient({ [a2]: "a2", [b2]: "b2" }), OPTS, {});
+	const { report } = await retry.apply(plan, saved);
+	assert.deepEqual(report.conflicts, []);
+	assert.deepEqual([...adapter.store.keys()].sort(), ["a.md", "big.db"]);
+});
+
 const engine = await loadEngine();
 let failed = 0;
 
