@@ -368,6 +368,68 @@ async function run(engine, client, ctx) {
 		stateA = state;
 		assertEqual(await exists(a.root, ".obsidian/plugins/github-sync/data.json"), false, ".obsidian written");
 	});
+
+	await test("full resync discards every local change and leaves nothing to push", async () => {
+		// Every kind of local divergence at once: an edit, a deleted tracked
+		// file, and untracked files (one nested, one hidden). The remote also
+		// moves, so the resync has something genuine to pull.
+		await write(a.root, "Note.md", "# Note\nunpushed local edit\n");
+		await fs.rm(path.join(a.root, "bulk/File 0.md"));
+		await write(a.root, "Resync draft.md", "never pushed\n");
+		await write(a.root, "deep/er/Scratch.md", "never pushed either\n");
+		await write(a.root, ".scratch/hidden.md", "hidden and untracked\n");
+		await remoteCommit(client, ctx, { "From remote.md": "arrived meanwhile\n" }, `e2e ${RUN_ID}: before resync`);
+		const remoteBefore = await remoteFiles(client, ctx);
+		const noteBefore = await readRemote(client, ctx, "Note.md");
+
+		const plan = await a.sync.planResync();
+		assertEqual(plan.mode, "full", "a resync is a full plan");
+		assertEqual(plan.overwritten.join(","), "Note.md", "files reported as overwritten");
+		assertEqual(
+			[...plan.localOnly].sort().join(","),
+			".scratch/hidden.md,Resync draft.md,deep/er/Scratch.md",
+			"files reported as deleted",
+		);
+
+		const { report, state } = await a.sync.apply(plan, null);
+		stateA = state;
+		assertEqual(report.conflicts.length, 0, "a resync must not keep conflict copies");
+		assertEqual(report.integrityFailures.length, 0, "integrity failures");
+		assertEqual(state.commit, plan.targetCommit, "state lands on the resynced commit");
+
+		// The vault is now exactly the remote folder: same paths, same bytes.
+		// The config folder is excluded on both sides: the previous test commits
+		// a file there that the engine refuses to materialize.
+		const synced = (p) => !p.startsWith(".obsidian/");
+		const local = (await localFiles(a.root)).filter(synced);
+		assertEqual(local.join(","), remoteBefore.filter(synced).join(","), "local files match the remote");
+		const head = await client.listTree(ctx.owner, ctx.repo, plan.targetCommit);
+		for (const blob of head.filter((b) => b.path.startsWith(`${REMOTE_FOLDER}/`))) {
+			const relative = blob.path.slice(REMOTE_FOLDER.length + 1);
+			if (!synced(relative)) continue;
+			assertEqual(state.blobs[relative], blob.sha, `verified SHA of ${relative}`);
+		}
+		assertEqual(await read(a.root, "Note.md"), noteBefore, "local edit replaced by the remote version");
+		assertEqual(await read(a.root, "bulk/File 0.md"), "file 0\n", "deleted file restored");
+
+		// The resync itself pushed nothing...
+		assertEqual((await remoteFiles(client, ctx)).join(","), remoteBefore.join(","), "remote tree unchanged");
+		assertEqual(await readRemote(client, ctx, "Note.md"), noteBefore, "remote Note.md unchanged");
+		// ...and left nothing behind for the next regular sync to push.
+		const { report: next } = await settledPush(a.sync, stateA);
+		assertEqual(next.blocked, null, "the follow-up push should not be blocked");
+		assertEqual(next.uploaded.length + next.removed.length, 0, "the follow-up push finds no local changes");
+		assertEqual(next.commit, null, "the follow-up push makes no commit");
+	});
+}
+
+/** Every file under a vault root, vault-relative with forward slashes, sorted. */
+async function localFiles(root) {
+	const entries = await fs.readdir(root, { recursive: true, withFileTypes: true });
+	return entries
+		.filter((e) => e.isFile())
+		.map((e) => path.relative(root, path.join(e.parentPath ?? e.path, e.name)).split(path.sep).join("/"))
+		.sort();
 }
 
 /** Remove everything this run put in the repo, in one commit. */
