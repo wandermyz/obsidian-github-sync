@@ -19,6 +19,7 @@ import {
 } from "./auth";
 import { DeviceFlowModal } from "./deviceFlowModal";
 import { GitHubClient, errorStatus } from "./github";
+import { confirmResync } from "./resyncModal";
 import { SyncEngine, SyncReport } from "./sync";
 import { DEFAULT_LOCAL, LOCAL_FILE, LocalState, loadLocalState, saveLocalState } from "./storage";
 
@@ -118,7 +119,7 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 		this.addCommand({
 			id: "full-resync",
 			name: "Full resync (rebuild from scratch)",
-			callback: () => void this.sync("manual", true),
+			callback: () => void this.resync(),
 		});
 
 		this.addCommand({
@@ -332,23 +333,19 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 	}
 
 	/**
-	 * Pull changes from GitHub into the vault.
-	 *
-	 * `trigger` only affects how loudly it reports: a background run shouldn't
-	 * pop a notice every 15 minutes just to say nothing changed.
+	 * Check a sync can start: not already running, a repository set, a usable
+	 * token. Returns the repo and token, or null after telling the user why not.
 	 */
-	async sync(trigger: "manual" | "auto" | "startup", forceFull = false): Promise<void> {
-		const loud = trigger === "manual";
-
+	private async prepareRun(loud: boolean): Promise<{ owner: string; repo: string; token: string } | null> {
 		if (this.syncing) {
 			if (loud) new Notice("A sync is already running.");
-			return;
+			return null;
 		}
 
 		const [owner, repo] = this.settings.syncRepo.split("/");
 		if (!owner || !repo) {
 			if (loud) new Notice("Set the sync repository (owner/repo) in settings.");
-			return;
+			return null;
 		}
 
 		const token = await this.validAccessToken();
@@ -356,36 +353,51 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 			// Always loud: silence here looks identical to "nothing changed",
 			// and the user needs to know auto-sync has stopped working.
 			new Notice("GitHub Enterprise Sync: not signed in — sync skipped.");
-			return;
+			return null;
 		}
+		return { owner, repo, token };
+	}
+
+	private async createEngine(owner: string, repo: string, token: string): Promise<SyncEngine> {
+		const client = new GitHubClient(this.host, token);
+		const branch = this.settings.branch.trim() || (await client.defaultBranch(owner, repo));
+		return new SyncEngine(
+			this.app.vault,
+			client,
+			{
+				owner,
+				repo,
+				branch,
+				targetFolder: this.settings.targetFolder.trim(),
+				remoteFolder: this.settings.remoteFolder.trim(),
+				deviceLabel: this.deviceLabel(),
+			},
+			this.app.fileManager,
+		);
+	}
+
+	/**
+	 * Pull changes from GitHub into the vault, then push local ones.
+	 *
+	 * `trigger` only affects how loudly it reports: a background run shouldn't
+	 * pop a notice every 15 minutes just to say nothing changed.
+	 */
+	async sync(trigger: "manual" | "auto" | "startup"): Promise<void> {
+		const loud = trigger === "manual";
+		const run = await this.prepareRun(loud);
+		if (!run) return;
 
 		this.syncing = true;
 		this.renderStatusBar("Syncing…");
 
 		try {
-			const client = new GitHubClient(this.host, token);
-			const branch =
-				this.settings.branch.trim() || (await client.defaultBranch(owner, repo));
-
-			const engine = new SyncEngine(
-				this.app.vault,
-				client,
-				{
-					owner,
-					repo,
-					branch,
-					targetFolder: this.settings.targetFolder.trim(),
-					remoteFolder: this.settings.remoteFolder.trim(),
-					deviceLabel: this.deviceLabel(),
-				},
-				this.app.fileManager,
-			);
+			const engine = await this.createEngine(run.owner, run.repo, run.token);
 
 			// Pull, then push. Another device can land a commit between the two,
 			// which the push detects via the fast-forward check; the fix is simply
 			// to pull again and re-push, so the pair runs in a bounded loop.
 			for (let attempt = 1; ; attempt++) {
-				const pulled = await this.pull(engine, forceFull && attempt === 1, loud);
+				const pulled = await this.pull(engine, loud);
 				if (!pulled) return;
 
 				const push = await this.pushChanges(engine, loud);
@@ -410,9 +422,58 @@ export default class GitHubEnterpriseSyncPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * Rebuild the synced folder from the branch head, discarding local changes
+	 * after the user confirms. Strictly download-only: it never pushes, so a
+	 * broken local state can't be uploaded over the repository.
+	 */
+	async resync(): Promise<void> {
+		const run = await this.prepareRun(true);
+		if (!run) return;
+
+		this.syncing = true;
+		this.renderStatusBar("Checking local changes…");
+
+		try {
+			const engine = await this.createEngine(run.owner, run.repo, run.token);
+			const plan = await engine.planResync();
+
+			const source = `${this.settings.syncRepo}${this.settings.remoteFolder.trim() ? `/${this.settings.remoteFolder.trim()}` : ""}`;
+			this.renderStatusBar("Waiting for confirmation…");
+			if (!(await confirmResync(this.app, plan, source))) {
+				new Notice("Full resync cancelled. Nothing was changed.");
+				return;
+			}
+
+			// No prior state: every differing file is overwritten outright instead
+			// of being preserved as a conflict copy the next sync would push.
+			const { report, state } = await engine.apply(
+				plan,
+				null,
+				(done, total) => this.renderStatusBar(`Resyncing ${done}/${total}…`),
+				async (partial) => {
+					this.local.syncState = partial;
+					await this.saveLocal();
+				},
+			);
+			this.local.syncState = state;
+			await this.saveLocal();
+			this.reportSync(report, true);
+			if (!state.commit) {
+				new Notice("GitHub Enterprise Sync: resync incomplete — run it again before syncing.", 10000);
+			}
+		} catch (err) {
+			console.error("[github-enterprise-sync] resync failed", err);
+			this.notifyFailure("GitHub Enterprise Sync: full resync failed", err);
+		} finally {
+			this.syncing = false;
+			this.renderStatusBar();
+		}
+	}
+
 	/** Download side of a sync. Returns false if the run should stop here. */
-	private async pull(engine: SyncEngine, forceFull: boolean, loud: boolean): Promise<boolean> {
-		const state = forceFull ? null : this.local.syncState;
+	private async pull(engine: SyncEngine, loud: boolean): Promise<boolean> {
+		const state = this.local.syncState;
 		const plan = await engine.plan(state);
 
 		if (plan.writes.length === 0 && plan.deletes.length === 0) {
@@ -664,7 +725,7 @@ class GitHubEnterpriseSyncSettingTab extends PluginSettingTab {
 								)
 								.addButton((b) =>
 									b.setButtonText("Full resync").onClick(async () => {
-										await this.plugin.sync("manual", true);
+										await this.plugin.resync();
 										this.refresh();
 									}),
 								)

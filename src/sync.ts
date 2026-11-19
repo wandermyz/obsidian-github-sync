@@ -71,6 +71,14 @@ export interface SyncPlan {
 	unchanged: number;
 }
 
+/** A full plan plus what applying it discards locally. */
+export interface ResyncPlan extends SyncPlan {
+	/** Local files whose content differs from the remote version. */
+	overwritten: string[];
+	/** Local files the remote doesn't have; these are deleted. */
+	localOnly: string[];
+}
+
 /**
  * Files we refuse to materialize into the vault. The config folder would let a
  * repo overwrite the user's plugin config — including this plugin's own
@@ -84,7 +92,7 @@ function isRefused(path: string, configDir: string): boolean {
 /**
  * Mass-deletion guard. A push that removes most of what we synced is far more
  * likely to be a broken vault path than a deliberate cleanup, so it's refused
- * and the user is told to run a full resync if they meant it. Small vaults are
+ * and the user is told to delete them in the repository if they meant it. Small vaults are
  * exempt below MIN_DELETIONS_BEFORE_GUARD, where any fraction is meaningless.
  */
 const MAX_DELETION_FRACTION = 0.1;
@@ -257,6 +265,33 @@ export class SyncEngine {
 
 		writes.push({ path: vaultPath, blobSha: file.sha });
 		return true;
+	}
+
+	/**
+	 * Plan a full resync: make the target folder an exact copy of the branch
+	 * head, discarding every local change. Nothing is ever pushed from here.
+	 *
+	 * Local files the tree doesn't list are planned for deletion, so the next
+	 * regular sync can't push them back up. The two lists say what the user is
+	 * about to lose, so they can confirm before apply() runs. Apply the plan
+	 * with a null state: with no recorded SHAs, a differing file is overwritten
+	 * rather than kept as a conflict copy, which the next sync would push.
+	 */
+	async planResync(): Promise<ResyncPlan> {
+		const { owner, repo, branch } = this.opts;
+		const head = await this.client.branchHead(owner, repo, branch);
+		const plan = await this.fullPlan(head, "Full resync requested.");
+
+		const remote = new Map(plan.writes.map((w) => [w.path, w.blobSha]));
+		const overwritten: string[] = [];
+		const localOnly: string[] = [];
+		for (const path of await this.listLocalFiles()) {
+			const want = remote.get(path);
+			if (want === undefined) localOnly.push(path);
+			else if ((await this.hashOnDisk(path)) !== want) overwritten.push(path);
+		}
+
+		return { ...plan, deletes: localOnly, overwritten, localOnly };
 	}
 
 	private async fullPlan(head: string, reason: string): Promise<SyncPlan> {
@@ -453,7 +488,7 @@ export class SyncEngine {
 		) {
 			report.blocked =
 				`Refusing to push: ${changes.removed.length} of ${tracked} synced files are missing locally. ` +
-				`Run a full resync if this is intentional.`;
+				`Run a full resync to restore them from GitHub, or delete them in the repository if this is intentional.`;
 			return { report, state };
 		}
 

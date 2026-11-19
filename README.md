@@ -227,8 +227,10 @@ mismatches, conflicts, and refused pushes always raise a notice.
 ## Commands
 
 - **Sync now** — pull, then push
-- **Full resync (rebuild from scratch)** — ignores stored state and walks the
-  whole tree, then pushes as usual
+- **Full resync (rebuild from scratch)** — makes the synced folder an exact
+  copy of the branch, download only: it never pushes. Before it changes
+  anything, it lists the local files it will overwrite or delete and asks you
+  to confirm, because local changes that haven't been pushed are lost.
 - **Sign in to GitHub (device flow)**
 - **Verify GitHub access** — calls `/user`, lists a repo root, reads a file
 - **Sign out of GitHub**

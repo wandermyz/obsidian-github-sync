@@ -202,6 +202,20 @@ function memoryAdapter(files) {
 		writeBinary: async (p, data) => void store.set(p, data),
 		mkdir: async () => {},
 		trashLocal: async (p) => void store.delete(p),
+		// Flat listing of a folder's direct children, as Obsidian's adapter returns it.
+		list: async (dir) => {
+			const prefix = dir === "/" || dir === "" ? "" : `${dir}/`;
+			const files = new Set();
+			const folders = new Set();
+			for (const key of store.keys()) {
+				if (!key.startsWith(prefix)) continue;
+				const rest = key.slice(prefix.length);
+				const slash = rest.indexOf("/");
+				if (slash === -1) files.add(key);
+				else folders.add(prefix + rest.slice(0, slash));
+			}
+			return { files: [...files], folders: [...folders] };
+		},
 	};
 }
 
@@ -292,6 +306,32 @@ test("a pull that fails partway checkpoints the files it already wrote", async (
 	const { report } = await retry.apply(plan, saved);
 	assert.deepEqual(report.conflicts, []);
 	assert.deepEqual([...adapter.store.keys()].sort(), ["a.md", "big.db"]);
+});
+
+test("a full resync discards local changes without leaving anything to push", async (engine) => {
+	const [same, remoteB, mine] = await Promise.all(["same", "remote b", "mine"].map(engine.gitBlobShaOfText));
+	const adapter = memoryAdapter({ "a.md": "same", "b.md": "mine", "local-only.md": "draft", "sub/new.md": "x" });
+	const client = {
+		...blobClient({ [same]: "same", [remoteB]: "remote b" }),
+		branchHead: async () => HEAD,
+		listTree: async () => [
+			{ path: "a.md", sha: same, size: 1 },
+			{ path: "b.md", sha: remoteB, size: 1 },
+		],
+	};
+	const sync = new engine.SyncEngine(memoryVault(adapter), client, OPTS, {});
+
+	const plan = await sync.planResync();
+	assert.deepEqual(plan.overwritten, ["b.md"], "only the file whose content differs is reported as lost");
+	assert.deepEqual(plan.localOnly.sort(), ["local-only.md", "sub/new.md"]);
+
+	const { report, state } = await sync.apply(plan, null);
+	assert.deepEqual(report.conflicts, [], "a resync must not keep conflict copies, which the next sync would push");
+	assert.deepEqual([...adapter.store.keys()].sort(), ["a.md", "b.md"]);
+	assert.equal(new TextDecoder().decode(adapter.store.get("b.md")), "remote b");
+	assert.equal(state.commit, HEAD);
+	assert.deepEqual(state.blobs, { "a.md": same, "b.md": remoteB });
+	assert.notEqual(state.blobs["b.md"], mine);
 });
 
 const engine = await loadEngine();
